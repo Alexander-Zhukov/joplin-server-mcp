@@ -48,8 +48,9 @@ _session_id: Optional[str] = None
 _index: dict[str, dict] = {}
 _index_ts: float = 0
 _resource_index: dict[str, dict] = {}
+_server_etags: dict[str, str] = {}
 _resource_index_ready = False
-_index_building = False
+_index_lock: Optional[asyncio.Lock] = None
 INDEX_TTL = 120
 INDEX_CONCURRENCY = 50
 MAX_RESOURCE_SIZE = 50 * 1024 * 1024
@@ -199,7 +200,12 @@ def _parse_resource_metadata(raw: str) -> dict:
 
 def _save_index_cache():
     try:
-        data = {"index": _index, "resource_index": _resource_index, "ts": _index_ts}
+        data = {
+            "index": _index,
+            "resource_index": _resource_index,
+            "server_etags": _server_etags,
+            "ts": _index_ts,
+        }
         with open(INDEX_CACHE_FILE, "w") as f:
             json.dump(data, f)
     except Exception as e:
@@ -207,12 +213,13 @@ def _save_index_cache():
 
 
 def _load_index_cache() -> bool:
-    global _index, _index_ts, _resource_index, _resource_index_ready
+    global _index, _index_ts, _resource_index, _resource_index_ready, _server_etags
     try:
         with open(INDEX_CACHE_FILE) as f:
             data = json.load(f)
         _index = data.get("index", {})
         _resource_index = data.get("resource_index", {})
+        _server_etags = data.get("server_etags", {})
         _index_ts = data.get("ts", 0)
         _resource_index_ready = bool(_resource_index)
         logger.info(f"Loaded index from cache: {len(_index)} items, {len(_resource_index)} resources")
@@ -230,13 +237,23 @@ async def _fetch_item_content(name: str) -> Optional[dict]:
         return None
 
 
+def _get_index_lock() -> asyncio.Lock:
+    global _index_lock
+    if _index_lock is None:
+        _index_lock = asyncio.Lock()
+    return _index_lock
+
+
 async def _do_build_index() -> dict[str, dict]:
-    """Fetch all md items from Joplin Server and build index."""
-    global _index, _index_ts, _resource_index_ready, _index_building
-    _index_building = True
-    try:
+    """Incremental index: only fetch new/changed items based on server updated_time."""
+    global _index, _index_ts, _resource_index_ready, _server_etags
+
+    lock = _get_index_lock()
+    if lock.locked():
+        return _index
+
+    async with lock:
         t0 = time.time()
-        logger.info("Building index...")
         all_items, cursor = [], ""
         while True:
             params = {"limit": 100}
@@ -250,43 +267,52 @@ async def _do_build_index() -> dict[str, dict]:
             cursor = data.get("cursor", "")
 
         md_items = [it for it in all_items if it.get("name", "").endswith(".md")]
+        server_ids = set()
+        to_fetch = []
+
+        for it in md_items:
+            item_id = it["name"].replace(".md", "")
+            server_ids.add(item_id)
+            server_ut = str(it.get("updated_time", ""))
+            if _server_etags.get(item_id) != server_ut:
+                to_fetch.append((it["name"], item_id, server_ut))
+
+        deleted = [k for k in list(_index) if k not in server_ids and _index[k].get("type") != TYPE_RESOURCE]
+
+        if not to_fetch and not deleted:
+            _index_ts = time.time()
+            logger.info(f"Index up to date: {len(_index)} items ({time.time() - t0:.1f}s)")
+            return _index
+
+        logger.info(f"Syncing index: {len(to_fetch)} changed, {len(deleted)} deleted"
+                     f" (of {len(md_items)} total)")
+
         sem = asyncio.Semaphore(INDEX_CONCURRENCY)
 
         async def _fetch_with_sem(name: str) -> Optional[dict]:
             async with sem:
                 return await _fetch_item_content(name)
 
-        results = await asyncio.gather(*[_fetch_with_sem(it["name"]) for it in md_items])
-        new_index: dict[str, dict] = {}
-        for parsed in results:
+        results = await asyncio.gather(*[_fetch_with_sem(name) for name, _, _ in to_fetch])
+        for (_, item_id, server_ut), parsed in zip(to_fetch, results):
+            _server_etags[item_id] = server_ut
             if parsed and parsed["id"]:
-                new_index[parsed["id"]] = parsed
+                _index[parsed["id"]] = parsed
 
-        _index = new_index
+        for item_id in deleted:
+            _index.pop(item_id, None)
+            _server_etags.pop(item_id, None)
+
         _index_ts = time.time()
         _resource_index_ready = False
         _save_index_cache()
-        logger.info(f"Index: {len(_index)} items in {time.time() - t0:.1f}s")
+        logger.info(f"Index: {len(_index)} items, synced {len(to_fetch)} in {time.time() - t0:.1f}s")
         return _index
-    finally:
-        _index_building = False
 
 
 async def _build_index(force: bool = False) -> dict[str, dict]:
-    """Return index, building from network or loading from disk cache."""
+    """Return index, triggering background refresh if TTL expired."""
     if not force and _index and (time.time() - _index_ts) < INDEX_TTL:
-        return _index
-
-    if not _index:
-        _load_index_cache()
-        if _index and (time.time() - _index_ts) < INDEX_TTL:
-            return _index
-
-    if _index_building:
-        if _index:
-            return _index
-        while _index_building:
-            await asyncio.sleep(0.5)
         return _index
 
     if _index:
@@ -519,11 +545,10 @@ type_: 6"""
 
 @asynccontextmanager
 async def _lifespan(server):
-    global _index_building
-    cached = _load_index_cache()
-    if not cached or (time.time() - _index_ts) > INDEX_TTL:
-        _index_building = True
-        asyncio.create_task(_do_build_index())
+    if not _index:
+        cached = _load_index_cache()
+        if not cached or (time.time() - _index_ts) > INDEX_TTL:
+            asyncio.create_task(_do_build_index())
     yield {}
 
 mcp = FastMCP(
