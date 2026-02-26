@@ -329,6 +329,8 @@ def _invalidate_index():
 mcp = FastMCP(
     "joplin-server",
     instructions="Access notes, notebooks, and tags in Joplin Server",
+    host=os.environ.get("MCP_HOST", "0.0.0.0"),
+    port=int(os.environ.get("MCP_PORT", "8081")),
 )
 
 
@@ -845,11 +847,4 @@ async def download_resource(resource_id: str) -> str:
 
 if __name__ == "__main__":
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
-    if transport == "sse":
-        mcp.run(
-            transport="sse",
-            host=os.environ.get("MCP_HOST", "0.0.0.0"),
-            port=int(os.environ.get("MCP_PORT", "8081")),
-        )
-    else:
-        mcp.run(transport="stdio")
+    mcp.run(transport=transport)
