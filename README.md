@@ -24,9 +24,15 @@
 | `get_note` | Get note text (resource references replaced with names) |
 | `get_note_full` | Get note with all resources embedded as base64 |
 | `create_note` | Create a new note |
-| `update_note` | Update note title and/or body |
+| `export_note` | Export note as markdown with resources as named base64 blocks |
+| `update_note` | Update note title, body, or move to another notebook |
 | `delete_note` | Delete a note |
 | `list_tags` | List all tags |
+| `create_tag` | Create a new tag |
+| `delete_tag` | Delete a tag |
+| `get_note_tags` | List tags assigned to a note |
+| `add_tag_to_note` | Add a tag to a note |
+| `remove_tag_from_note` | Remove a tag from a note |
 | `get_note_resources` | List resources attached to a note |
 | `get_resource_info` | Get resource metadata |
 | `download_resource` | Download a resource as base64 |
@@ -72,7 +78,7 @@ python app/server.py
 ### Build from source
 
 ```bash
-docker build -t joplin-server-mcp .
+docker build -t joplin-mcp .
 ```
 
 ## MCP client configuration
