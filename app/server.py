@@ -55,10 +55,6 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
-def _invalidate_index():
-    global _index_ts
-    _index_ts = 0
-
 
 # -- HTTP client & auth --
 
@@ -114,7 +110,9 @@ async def _put_item(item_id: str, content: str):
         content=content.encode("utf-8"),
         headers={"Content-Type": "application/octet-stream"},
     )
-    _invalidate_index()
+    parsed = _parse_joplin_item(content)
+    if parsed and parsed["id"]:
+        _index[parsed["id"]] = parsed
 
 
 # -- Joplin item parsing --
@@ -537,7 +535,8 @@ async def delete_notebook(notebook_id: str, force: bool = False) -> str:
             pass
 
     await _api("DELETE", f"/api/items/root:/{notebook_id}.md:")
-    _invalidate_index()
+    for cid in [child["id"] for child in children] + [notebook_id]:
+        _index.pop(cid, None)
 
     result = f"Notebook deleted: **{nb['title']}** (ID: `{notebook_id}`)"
     if deleted:
@@ -748,7 +747,7 @@ async def delete_note(note_id: str) -> str:
         if parsed["type"] != TYPE_NOTE:
             return f"Item {note_id} is not a note."
         await _api("DELETE", f"/api/items/root:/{note_id}.md:")
-        _invalidate_index()
+        _index.pop(note_id, None)
         return f"Note deleted: **{parsed['title']}** (ID: `{note_id}`)"
     except httpx.HTTPStatusError as e:
         return f"Note {note_id} not found." if e.response.status_code == 404 else str(e)
@@ -800,7 +799,9 @@ async def delete_tag(tag_id: str) -> str:
             pass
 
     await _api("DELETE", f"/api/items/root:/{tag_id}.md:")
-    _invalidate_index()
+    for nt in note_tags:
+        _index.pop(nt["id"], None)
+    _index.pop(tag_id, None)
     return f"Tag deleted: **{tag['title']}** (ID: `{tag_id}`, removed from {len(note_tags)} notes)"
 
 
@@ -874,7 +875,7 @@ async def remove_tag_from_note(tag_id: str, note_id: str) -> str:
 
     for nt in note_tags:
         await _api("DELETE", f"/api/items/root:/{nt['id']}.md:")
-    _invalidate_index()
+        _index.pop(nt["id"], None)
 
     tag = idx.get(tag_id)
     note = idx.get(note_id)
