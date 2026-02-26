@@ -115,7 +115,7 @@ docker build -t joplin-mcp .
 
 ## How it works
 
-The server authenticates with Joplin Server via email/password sessions and builds an in-memory index of all items (notes, notebooks, tags, resources) with a 2-minute TTL cache. Items are fetched in parallel batches for performance.
+The server authenticates with Joplin Server via email/password sessions and builds an in-memory index of all items (notes, notebooks, tags) with a 2-minute TTL cache. The index is persisted to disk so restarts are instant. Resource metadata is loaded lazily on first access. Background refresh keeps the index up to date without blocking requests.
 
 Joplin's internal serialization format (title + markdown body + metadata block) is parsed and presented as clean structured output.
 

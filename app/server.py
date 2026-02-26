@@ -2,7 +2,9 @@
 
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 import datetime
+import json
 import os
 import re
 import logging
@@ -46,9 +48,12 @@ _session_id: Optional[str] = None
 _index: dict[str, dict] = {}
 _index_ts: float = 0
 _resource_index: dict[str, dict] = {}
+_resource_index_ready = False
+_index_building = False
 INDEX_TTL = 120
-BATCH_SIZE = 20
+INDEX_CONCURRENCY = 50
 MAX_RESOURCE_SIZE = 50 * 1024 * 1024
+INDEX_CACHE_FILE = "/tmp/joplin_index_cache.json"
 
 
 def _now() -> str:
@@ -61,7 +66,14 @@ def _now() -> str:
 async def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(verify=False, timeout=30)
+        _client = httpx.AsyncClient(
+            verify=False,
+            timeout=30,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=60,
+            ),
+        )
     return _client
 
 
@@ -185,6 +197,30 @@ def _parse_resource_metadata(raw: str) -> dict:
 
 # -- Index --
 
+def _save_index_cache():
+    try:
+        data = {"index": _index, "resource_index": _resource_index, "ts": _index_ts}
+        with open(INDEX_CACHE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.warning(f"Failed to save index cache: {e}")
+
+
+def _load_index_cache() -> bool:
+    global _index, _index_ts, _resource_index, _resource_index_ready
+    try:
+        with open(INDEX_CACHE_FILE) as f:
+            data = json.load(f)
+        _index = data.get("index", {})
+        _resource_index = data.get("resource_index", {})
+        _index_ts = data.get("ts", 0)
+        _resource_index_ready = bool(_resource_index)
+        logger.info(f"Loaded index from cache: {len(_index)} items, {len(_resource_index)} resources")
+        return bool(_index)
+    except Exception:
+        return False
+
+
 async def _fetch_item_content(name: str) -> Optional[dict]:
     try:
         resp = await _api("GET", f"/api/items/root:/{name}:/content")
@@ -194,14 +230,82 @@ async def _fetch_item_content(name: str) -> Optional[dict]:
         return None
 
 
-async def _build_index(force: bool = False) -> dict[str, dict]:
-    """Fetch all items and resources, cache for INDEX_TTL seconds."""
-    global _index, _index_ts, _resource_index
+async def _do_build_index() -> dict[str, dict]:
+    """Fetch all md items from Joplin Server and build index."""
+    global _index, _index_ts, _resource_index_ready, _index_building
+    _index_building = True
+    try:
+        t0 = time.time()
+        logger.info("Building index...")
+        all_items, cursor = [], ""
+        while True:
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            resp = await _api("GET", "/api/items/root:/:/children", params=params)
+            data = resp.json()
+            all_items.extend(data.get("items", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("cursor", "")
 
+        md_items = [it for it in all_items if it.get("name", "").endswith(".md")]
+        sem = asyncio.Semaphore(INDEX_CONCURRENCY)
+
+        async def _fetch_with_sem(name: str) -> Optional[dict]:
+            async with sem:
+                return await _fetch_item_content(name)
+
+        results = await asyncio.gather(*[_fetch_with_sem(it["name"]) for it in md_items])
+        new_index: dict[str, dict] = {}
+        for parsed in results:
+            if parsed and parsed["id"]:
+                new_index[parsed["id"]] = parsed
+
+        _index = new_index
+        _index_ts = time.time()
+        _resource_index_ready = False
+        _save_index_cache()
+        logger.info(f"Index: {len(_index)} items in {time.time() - t0:.1f}s")
+        return _index
+    finally:
+        _index_building = False
+
+
+async def _build_index(force: bool = False) -> dict[str, dict]:
+    """Return index, building from network or loading from disk cache."""
     if not force and _index and (time.time() - _index_ts) < INDEX_TTL:
         return _index
 
-    logger.info("Building index...")
+    if not _index:
+        _load_index_cache()
+        if _index and (time.time() - _index_ts) < INDEX_TTL:
+            return _index
+
+    if _index_building:
+        if _index:
+            return _index
+        while _index_building:
+            await asyncio.sleep(0.5)
+        return _index
+
+    if _index:
+        asyncio.create_task(_do_build_index())
+        return _index
+
+    return await _do_build_index()
+
+
+async def _ensure_resource_index():
+    """Build resource index lazily on first access."""
+    global _resource_index, _resource_index_ready
+    if _resource_index_ready:
+        return
+
+    await _build_index()
+
+    t0 = time.time()
+    logger.info("Building resource index...")
     all_items, cursor = [], ""
     while True:
         params = {"limit": 100}
@@ -214,36 +318,27 @@ async def _build_index(force: bool = False) -> dict[str, dict]:
             break
         cursor = data.get("cursor", "")
 
-    md_items = [it for it in all_items if it.get("name", "").endswith(".md")]
     resource_items = [it for it in all_items if it.get("name", "").startswith(".resource/")]
-
-    new_index: dict[str, dict] = {}
-    for i in range(0, len(md_items), BATCH_SIZE):
-        results = await asyncio.gather(*[_fetch_item_content(it["name"]) for it in md_items[i:i + BATCH_SIZE]])
-        for parsed in results:
-            if parsed and parsed["id"]:
-                new_index[parsed["id"]] = parsed
-
-    new_res_index: dict[str, dict] = {}
+    sem = asyncio.Semaphore(INDEX_CONCURRENCY)
 
     async def _fetch_res_meta(name: str) -> Optional[dict]:
-        try:
-            resp = await _api("GET", f"/api/items/root:/{name.split('/')[-1]}.md:/content")
-            return _parse_resource_metadata(resp.text)
-        except Exception:
-            return None
+        async with sem:
+            try:
+                resp = await _api("GET", f"/api/items/root:/{name.split('/')[-1]}.md:/content")
+                return _parse_resource_metadata(resp.text)
+            except Exception:
+                return None
 
-    for i in range(0, len(resource_items), BATCH_SIZE):
-        results = await asyncio.gather(*[_fetch_res_meta(it["name"]) for it in resource_items[i:i + BATCH_SIZE]])
-        for parsed in results:
-            if parsed and parsed["id"]:
-                new_res_index[parsed["id"]] = parsed
+    results = await asyncio.gather(*[_fetch_res_meta(it["name"]) for it in resource_items])
+    new_res_index: dict[str, dict] = {}
+    for parsed in results:
+        if parsed and parsed["id"]:
+            new_res_index[parsed["id"]] = parsed
 
-    _index = new_index
-    _index_ts = time.time()
     _resource_index = new_res_index
-    logger.info(f"Index: {len(_index)} items, {len(_resource_index)} resources")
-    return _index
+    _resource_index_ready = True
+    _save_index_cache()
+    logger.info(f"Resource index: {len(_resource_index)} resources in {time.time() - t0:.1f}s")
 
 
 async def _get_items_by_type(type_id: int, force_refresh: bool = False) -> list[dict]:
@@ -283,7 +378,7 @@ async def _fetch_note(note_id: str) -> dict:
 
 async def _download_resource(resource_id: str) -> tuple[bytes, str, str]:
     """Returns (bytes, mime, title)."""
-    await _build_index()
+    await _ensure_resource_index()
     res = _resource_index.get(resource_id)
     resp = await _api("GET", f"/api/items/root:/.resource/{resource_id}:/content")
     return resp.content, res["mime"] if res else "application/octet-stream", res["title"] if res else resource_id
@@ -422,11 +517,21 @@ type_: 6"""
 
 # ===== MCP tools =====
 
+@asynccontextmanager
+async def _lifespan(server):
+    global _index_building
+    cached = _load_index_cache()
+    if not cached or (time.time() - _index_ts) > INDEX_TTL:
+        _index_building = True
+        asyncio.create_task(_do_build_index())
+    yield {}
+
 mcp = FastMCP(
     "joplin-server",
     instructions="Access notes, notebooks, and tags in Joplin Server",
     host=os.environ.get("MCP_HOST", "0.0.0.0"),
     port=int(os.environ.get("MCP_PORT", "8081")),
+    lifespan=_lifespan,
 )
 
 
@@ -611,7 +716,7 @@ async def get_note(note_id: str) -> str:
     try:
         parsed = await _fetch_note(note_id)
         nb_name = await _notebook_name(parsed["parent_id"])
-        await _build_index()
+        await _ensure_resource_index()
         return _format_note_header(parsed, nb_name) + _replace_resource_refs(parsed["body"])
     except ValueError as e:
         return str(e)
@@ -629,7 +734,7 @@ async def get_note_full(note_id: str) -> str:
     try:
         parsed = await _fetch_note(note_id)
         nb_name = await _notebook_name(parsed["parent_id"])
-        await _build_index()
+        await _ensure_resource_index()
 
         resource_refs = _find_resource_refs(parsed["body"])
         if not resource_refs:
@@ -665,7 +770,7 @@ async def export_note(note_id: str) -> str:
     """
     try:
         parsed = await _fetch_note(note_id)
-        await _build_index()
+        await _ensure_resource_index()
 
         resource_refs = _find_resource_refs(parsed["body"])
         output = f"TITLE:{parsed['title']}\n\n{_localize_resource_refs(parsed['body'])}"
@@ -891,7 +996,7 @@ async def get_note_resources(note_id: str) -> str:
     Args:
         note_id: The Joplin note ID
     """
-    await _build_index()
+    await _ensure_resource_index()
     note = _index.get(note_id)
     if not note:
         return f"Note {note_id} not found."
@@ -919,7 +1024,7 @@ async def get_resource_info(resource_id: str) -> str:
     Args:
         resource_id: The Joplin resource ID (32-char hex)
     """
-    await _build_index()
+    await _ensure_resource_index()
     res = _resource_index.get(resource_id)
     if not res:
         try:
@@ -946,7 +1051,7 @@ async def download_resource(resource_id: str) -> str:
     Args:
         resource_id: The Joplin resource ID (32-char hex)
     """
-    await _build_index()
+    await _ensure_resource_index()
     res = _resource_index.get(resource_id)
     if res and res["size"] > MAX_RESOURCE_SIZE:
         return f"Resource too large ({res['size'] / 1024 / 1024:.1f} MB). Max 50 MB."
