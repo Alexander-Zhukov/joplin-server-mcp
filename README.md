@@ -18,10 +18,13 @@
 | `list_notebooks` | List all notebooks |
 | `get_notebook` | Get notebook details with notes and sub-notebooks |
 | `create_notebook` | Create a new notebook |
+| `update_notebook` | Rename or move a notebook (with circular reference check) |
 | `delete_notebook` | Delete a notebook (with optional force for non-empty) |
 | `list_notes` | List notes, optionally filtered by notebook |
+| `get_all_notes` | Get all notes with pagination, sorting, and notebook filter |
 | `search_notes` | Search notes by text in title or body |
 | `get_note` | Get note text (resource references replaced with names) |
+| `get_notes_batch` | Read multiple notes at once (up to 50, parallel) |
 | `get_note_full` | Get note with all resources embedded as base64 |
 | `create_note` | Create a new note |
 | `export_note` | Export note as markdown with resources as named base64 blocks |
@@ -115,7 +118,7 @@ docker build -t joplin-mcp .
 
 ## How it works
 
-The server authenticates with Joplin Server via email/password sessions and builds an in-memory index of all items (notes, notebooks, tags) with a 2-minute TTL cache. The index is persisted to disk so restarts are instant. Resource metadata is loaded lazily on first access. Background refresh keeps the index up to date without blocking requests.
+The server authenticates with Joplin Server via email/password sessions and builds an in-memory index of all items (notes, notebooks, tags) with a 2-minute TTL cache. Incremental sync compares server-side `updated_time` with cached etags, fetching only changed items (typical refresh: ~5s vs ~35s full rebuild). The index is persisted to disk so container restarts are instant. Resource metadata is loaded lazily on first access. Background refresh keeps the index up to date without blocking requests. All IDs are validated (32-char hex) before API calls.
 
 Joplin's internal serialization format (title + markdown body + metadata block) is parsed and presented as clean structured output.
 
