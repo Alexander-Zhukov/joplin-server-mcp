@@ -57,6 +57,16 @@ MAX_RESOURCE_SIZE = 50 * 1024 * 1024
 INDEX_CACHE_FILE = "/tmp/joplin_index_cache.json"
 
 
+_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _validate_id(value: str, label: str = "ID") -> Optional[str]:
+    """Return error message if value is not a valid 32-char hex Joplin ID, else None."""
+    if not value or not _ID_RE.match(value):
+        return f"Invalid {label}: '{value}'. Must be a 32-character hex string."
+    return None
+
+
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -594,6 +604,9 @@ async def get_notebook(notebook_id: str) -> str:
     Args:
         notebook_id: The Joplin notebook ID
     """
+    err = _validate_id(notebook_id, "notebook ID")
+    if err:
+        return err
     idx = await _build_index(force=True)
     nb = idx.get(notebook_id)
     if not nb or nb["type"] != TYPE_FOLDER:
@@ -645,6 +658,9 @@ async def delete_notebook(notebook_id: str, force: bool = False) -> str:
         notebook_id: The notebook ID to delete
         force: Delete with all contents
     """
+    err = _validate_id(notebook_id, "notebook ID")
+    if err:
+        return err
     idx = await _build_index(force=True)
     nb = idx.get(notebook_id)
     if not nb or nb["type"] != TYPE_FOLDER:
@@ -738,6 +754,9 @@ async def get_note(note_id: str) -> str:
     Args:
         note_id: The Joplin note ID
     """
+    err = _validate_id(note_id, "note ID")
+    if err:
+        return err
     try:
         parsed = await _fetch_note(note_id)
         nb_name = await _notebook_name(parsed["parent_id"])
@@ -756,6 +775,9 @@ async def get_note_full(note_id: str) -> str:
     Args:
         note_id: The Joplin note ID
     """
+    err = _validate_id(note_id, "note ID")
+    if err:
+        return err
     try:
         parsed = await _fetch_note(note_id)
         nb_name = await _notebook_name(parsed["parent_id"])
@@ -793,6 +815,9 @@ async def export_note(note_id: str) -> str:
     Args:
         note_id: The Joplin note ID
     """
+    err = _validate_id(note_id, "note ID")
+    if err:
+        return err
     try:
         parsed = await _fetch_note(note_id)
         await _ensure_resource_index()
@@ -871,6 +896,9 @@ async def delete_note(note_id: str) -> str:
     Args:
         note_id: The note ID to delete
     """
+    err = _validate_id(note_id, "note ID")
+    if err:
+        return err
     try:
         resp = await _api("GET", f"/api/items/root:/{note_id}.md:/content")
         parsed = _parse_joplin_item(resp.text)
@@ -881,6 +909,172 @@ async def delete_note(note_id: str) -> str:
         return f"Note deleted: **{parsed['title']}** (ID: `{note_id}`)"
     except httpx.HTTPStatusError as e:
         return f"Note {note_id} not found." if e.response.status_code == 404 else str(e)
+
+
+@mcp.tool()
+async def get_notes_batch(note_ids: list[str]) -> str:
+    """Read full content of multiple notes at once.
+
+    Args:
+        note_ids: List of note IDs to read
+    """
+    if not note_ids:
+        return "No note IDs provided."
+    if len(note_ids) > 50:
+        return "Too many IDs (max 50)."
+
+    invalid = [nid for nid in note_ids if _validate_id(nid, "")]
+    if invalid:
+        return f"Invalid note IDs: {', '.join(invalid)}"
+
+    await _ensure_resource_index()
+
+    async def _read_one(nid: str) -> str:
+        try:
+            parsed = await _fetch_note(nid)
+            nb_name = await _notebook_name(parsed["parent_id"])
+            return _format_note_header(parsed, nb_name) + _replace_resource_refs(parsed["body"])
+        except httpx.HTTPStatusError as e:
+            return f"# {nid}\n\nNot found." if e.response.status_code == 404 else f"# {nid}\n\nError: {e}"
+        except ValueError as e:
+            return f"# {nid}\n\n{e}"
+
+    results = await asyncio.gather(*[_read_one(nid) for nid in note_ids])
+    header = f"# Batch read: {len(note_ids)} notes\n\n"
+    return header + "\n\n---\n\n".join(results)
+
+
+@mcp.tool()
+async def get_all_notes(
+    notebook_id: Optional[str] = None,
+    order_by: str = "updated_time",
+    order_dir: str = "desc",
+    page: int = 1,
+    limit: int = 50,
+) -> str:
+    """Get all notes with optional filtering, pagination, and sorting.
+
+    Args:
+        notebook_id: Filter by notebook ID (optional)
+        order_by: Sort field: updated_time, created_time, title (default: updated_time)
+        order_dir: Sort direction: asc or desc (default: desc)
+        page: Page number starting from 1 (default: 1)
+        limit: Notes per page, max 100 (default: 50)
+    """
+    if notebook_id:
+        err = _validate_id(notebook_id, "notebook ID")
+        if err:
+            return err
+
+    limit = max(1, min(limit, 100))
+    page = max(1, page)
+    order_dir = order_dir.lower()
+    if order_dir not in ("asc", "desc"):
+        return "order_dir must be 'asc' or 'desc'."
+    if order_by not in ("updated_time", "created_time", "title"):
+        return "order_by must be 'updated_time', 'created_time', or 'title'."
+
+    notes = await _get_items_by_type(TYPE_NOTE)
+    if notebook_id:
+        idx = await _build_index()
+        nb = idx.get(notebook_id)
+        if not nb or nb["type"] != TYPE_FOLDER:
+            return f"Notebook {notebook_id} not found."
+        notes = [n for n in notes if n["parent_id"] == notebook_id]
+
+    reverse = order_dir == "desc"
+    if order_by == "title":
+        notes.sort(key=lambda x: x["title"].lower(), reverse=reverse)
+    else:
+        notes.sort(key=lambda x: x.get(order_by, ""), reverse=reverse)
+
+    total = len(notes)
+    start = (page - 1) * limit
+    page_notes = notes[start:start + limit]
+    total_pages = max(1, (total + limit - 1) // limit)
+
+    if not page_notes:
+        return f"No notes found (page {page}/{total_pages})."
+
+    scope = f" in **{(await _build_index()).get(notebook_id, {}).get('title', notebook_id)}**" if notebook_id else ""
+    lines = [f"Notes{scope} ({total} total, page {page}/{total_pages})\n"]
+
+    for i, note in enumerate(page_notes, start=start + 1):
+        nb_name = await _notebook_name(note["parent_id"])
+        todo = "[todo] " if note["is_todo"] else ""
+        preview = note["body"][:80].replace("\n", " ") if note["body"] else ""
+        lines.append(
+            f"{i}. {todo}**{note['title']}** `{note['id']}`\n"
+            f"   {nb_name} | {note['updated_time'][:10]}\n"
+            f"   _{preview}{'...' if len(note.get('body', '')) > 80 else ''}_"
+        )
+
+    if total_pages > 1:
+        lines.append(f"\n_Page {page}/{total_pages}. Sorted by {order_by} {order_dir}._")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def update_notebook(
+    notebook_id: str,
+    title: Optional[str] = None,
+    parent_id: Optional[str] = None,
+) -> str:
+    """Update a notebook's title or move it to a different parent.
+
+    Args:
+        notebook_id: The notebook ID to update
+        title: New title (optional)
+        parent_id: New parent notebook ID, empty string for root (optional)
+    """
+    err = _validate_id(notebook_id, "notebook ID")
+    if err:
+        return err
+    if parent_id is not None and parent_id != "":
+        err = _validate_id(parent_id, "parent notebook ID")
+        if err:
+            return err
+
+    if title is None and parent_id is None:
+        return "Provide at least title or parent_id to update."
+
+    resp = await _api("GET", f"/api/items/root:/{notebook_id}.md:/content")
+    parsed = _parse_joplin_item(resp.text)
+    if parsed["type"] != TYPE_FOLDER:
+        return f"Item {notebook_id} is not a notebook."
+
+    if parent_id is not None and parent_id == notebook_id:
+        return "Cannot move a notebook into itself."
+    if parent_id is not None:
+        idx = await _build_index()
+        check_id = parent_id
+        while check_id:
+            ancestor = idx.get(check_id)
+            if not ancestor:
+                break
+            if ancestor["parent_id"] == notebook_id:
+                return "Cannot move: would create a circular reference."
+            check_id = ancestor["parent_id"]
+
+    new_title = title if title is not None else parsed["title"]
+    now = _now()
+    meta = parsed["metadata"]
+    meta["updated_time"] = now
+    meta["user_updated_time"] = now
+    if parent_id is not None:
+        meta["parent_id"] = parent_id
+
+    content = f"{new_title}\n\n" + "\n".join(f"{k}: {v}" for k, v in meta.items())
+    await _put_item(notebook_id, content)
+
+    changes = []
+    if title is not None:
+        changes.append(f"renamed to **{new_title}**")
+    if parent_id is not None:
+        dest = "root" if not parent_id else f"**{(await _notebook_name(parent_id))}**"
+        changes.append(f"moved to {dest}")
+    return f"Notebook updated: {', '.join(changes)} (ID: `{notebook_id}`)"
 
 
 # -- Tags --
@@ -916,6 +1110,9 @@ async def delete_tag(tag_id: str) -> str:
     Args:
         tag_id: The tag ID to delete
     """
+    err = _validate_id(tag_id, "tag ID")
+    if err:
+        return err
     idx = await _build_index(force=True)
     tag = idx.get(tag_id)
     if not tag or tag["type"] != TYPE_TAG:
@@ -942,6 +1139,9 @@ async def get_note_tags(note_id: str) -> str:
     Args:
         note_id: The Joplin note ID
     """
+    err = _validate_id(note_id, "note ID")
+    if err:
+        return err
     idx = await _build_index()
     note = idx.get(note_id)
     if not note or note["type"] != TYPE_NOTE:
@@ -967,6 +1167,10 @@ async def add_tag_to_note(tag_id: str, note_id: str) -> str:
         tag_id: The tag ID
         note_id: The note ID
     """
+    for val, label in [(tag_id, "tag ID"), (note_id, "note ID")]:
+        err = _validate_id(val, label)
+        if err:
+            return err
     idx = await _build_index()
     tag = idx.get(tag_id)
     if not tag or tag["type"] != TYPE_TAG:
@@ -995,6 +1199,10 @@ async def remove_tag_from_note(tag_id: str, note_id: str) -> str:
         tag_id: The tag ID
         note_id: The note ID
     """
+    for val, label in [(tag_id, "tag ID"), (note_id, "note ID")]:
+        err = _validate_id(val, label)
+        if err:
+            return err
     idx = await _build_index()
     note_tags = [
         v for v in idx.values()
@@ -1021,6 +1229,9 @@ async def get_note_resources(note_id: str) -> str:
     Args:
         note_id: The Joplin note ID
     """
+    err = _validate_id(note_id, "note ID")
+    if err:
+        return err
     await _ensure_resource_index()
     note = _index.get(note_id)
     if not note:
@@ -1049,6 +1260,9 @@ async def get_resource_info(resource_id: str) -> str:
     Args:
         resource_id: The Joplin resource ID (32-char hex)
     """
+    err = _validate_id(resource_id, "resource ID")
+    if err:
+        return err
     await _ensure_resource_index()
     res = _resource_index.get(resource_id)
     if not res:
@@ -1076,6 +1290,9 @@ async def download_resource(resource_id: str) -> str:
     Args:
         resource_id: The Joplin resource ID (32-char hex)
     """
+    err = _validate_id(resource_id, "resource ID")
+    if err:
+        return err
     await _ensure_resource_index()
     res = _resource_index.get(resource_id)
     if res and res["size"] > MAX_RESOURCE_SIZE:
