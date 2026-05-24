@@ -465,7 +465,24 @@ async def _download_refs(resource_refs: list[str]) -> list[tuple[str, Optional[b
 
 # -- Joplin item templates --
 
-def _note_template(note_id: str, title: str, body: str, notebook_id: str, now: str) -> str:
+async def _parent_share_id(parent_id: str) -> str:
+    """Return the share_id of the parent notebook, or '' if no parent / not shared / missing.
+
+    Joplin propagates a notebook's share_id to all descendants; new notes and
+    sub-notebooks must inherit it or they will not appear for other participants
+    of the share.
+    """
+    if not parent_id:
+        return ""
+    try:
+        resp = await _api("GET", f"/api/items/root:/{parent_id}.md:/content")
+        parsed = _parse_joplin_item(resp.text)
+        return parsed.get("metadata", {}).get("share_id", "") or ""
+    except Exception:
+        return ""
+
+
+def _note_template(note_id: str, title: str, body: str, notebook_id: str, now: str, share_id: str = "") -> str:
     return f"""{title}
 
 {body}
@@ -493,7 +510,7 @@ encryption_cipher_text:
 encryption_applied: 0
 markup_language: 1
 is_shared: 0
-share_id: 
+share_id: {share_id}
 conflict_original_id: 
 master_key_id: 
 user_data: 
@@ -501,7 +518,7 @@ deleted_time: 0
 type_: 1"""
 
 
-def _folder_template(folder_id: str, title: str, parent_id: str, now: str) -> str:
+def _folder_template(folder_id: str, title: str, parent_id: str, now: str, share_id: str = "") -> str:
     return f"""{title}
 
 id: {folder_id}
@@ -513,7 +530,7 @@ user_updated_time: {now}
 encryption_cipher_text: 
 encryption_applied: 0
 is_shared: 0
-share_id: 
+share_id: {share_id}
 master_key_id: 
 icon: 
 deleted_time: 0
@@ -646,7 +663,8 @@ async def create_notebook(title: str, parent_id: str = "") -> str:
         parent_id: Parent notebook ID for nesting (optional)
     """
     nb_id = uuid.uuid4().hex
-    await _put_item(nb_id, _folder_template(nb_id, title, parent_id, _now()))
+    share_id = await _parent_share_id(parent_id)
+    await _put_item(nb_id, _folder_template(nb_id, title, parent_id, _now(), share_id))
     return f"Notebook created: **{title}** (ID: `{nb_id}`)"
 
 
@@ -850,7 +868,8 @@ async def create_note(title: str, body: str, notebook_id: str = "") -> str:
         notebook_id: Parent notebook ID (optional)
     """
     note_id = uuid.uuid4().hex
-    await _put_item(note_id, _note_template(note_id, title, body, notebook_id, _now()))
+    share_id = await _parent_share_id(notebook_id)
+    await _put_item(note_id, _note_template(note_id, title, body, notebook_id, _now(), share_id))
     return f"Note created: **{title}** (ID: `{note_id}`)"
 
 
@@ -883,6 +902,7 @@ async def update_note(
     meta["user_updated_time"] = now
     if notebook_id is not None:
         meta["parent_id"] = notebook_id
+        meta["share_id"] = await _parent_share_id(notebook_id)
 
     content = f"{new_title}\n\n{new_body}\n\n" + "\n".join(f"{k}: {v}" for k, v in meta.items())
     await _put_item(note_id, content)
@@ -1064,6 +1084,7 @@ async def update_notebook(
     meta["user_updated_time"] = now
     if parent_id is not None:
         meta["parent_id"] = parent_id
+        meta["share_id"] = await _parent_share_id(parent_id)
 
     content = f"{new_title}\n\n" + "\n".join(f"{k}: {v}" for k, v in meta.items())
     await _put_item(notebook_id, content)
