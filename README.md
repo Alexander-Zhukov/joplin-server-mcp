@@ -8,7 +8,7 @@
 
 > **Note:** This MCP server connects to **Joplin Server** REST API, not the Joplin Desktop Web Clipper.
 >
-> **Joplin Cloud:** Should work with `JOPLIN_SERVER_URL=https://joplincloud.com`, but this has not been tested. If you try it — please open an issue with your results.
+> **Joplin Cloud:** Use `JOPLIN_SERVER_URL=https://api.joplincloud.com`.
 
 ## Tools
 
@@ -18,11 +18,12 @@
 | `list_notebooks` | List all notebooks |
 | `get_notebook` | Get notebook details with notes and sub-notebooks |
 | `create_notebook` | Create a new notebook |
+| `get_or_create_notebook` | Resolve a `/`-separated notebook path, creating missing levels |
 | `update_notebook` | Rename or move a notebook (with circular reference check) |
 | `delete_notebook` | Delete a notebook (with optional force for non-empty) |
-| `list_notes` | List notes, optionally filtered by notebook |
+| `list_notes` | List notes, optionally filtered by notebook and/or tag |
 | `get_all_notes` | Get all notes with pagination, sorting, and notebook filter |
-| `search_notes` | Search notes by text in title or body |
+| `search_notes` | Search notes (multi-term AND) with scope and notebook/tag filters |
 | `get_note` | Get note text (resource references replaced with names) |
 | `get_notes_batch` | Read multiple notes at once (up to 50, parallel) |
 | `get_note_full` | Get note with all resources embedded as base64 |
