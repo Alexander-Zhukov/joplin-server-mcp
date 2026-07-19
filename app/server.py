@@ -49,6 +49,7 @@ _index: dict[str, dict] = {}
 _index_ts: float = 0
 _resource_index: dict[str, dict] = {}
 _server_etags: dict[str, str] = {}
+_pending_puts: set[str] = set()
 _resource_index_ready = False
 _index_lock: Optional[asyncio.Lock] = None
 INDEX_TTL = 120
@@ -136,6 +137,7 @@ async def _put_item(item_id: str, content: str):
     parsed = _parse_joplin_item(content)
     if parsed and parsed["id"]:
         _index[parsed["id"]] = parsed
+        _pending_puts.add(parsed["id"])
 
 
 # -- Joplin item parsing --
@@ -287,7 +289,10 @@ async def _do_build_index() -> dict[str, dict]:
             if _server_etags.get(item_id) != server_ut:
                 to_fetch.append((it["name"], item_id, server_ut))
 
-        deleted = [k for k in list(_index) if k not in server_ids and _index[k].get("type") != TYPE_RESOURCE]
+        _pending_puts.intersection_update(_index)
+        _pending_puts.difference_update(server_ids)
+        deleted = [k for k in list(_index) if k not in server_ids
+                   and k not in _pending_puts and _index[k].get("type") != TYPE_RESOURCE]
 
         if not to_fetch and not deleted:
             _index_ts = time.time()
@@ -388,6 +393,19 @@ async def _notebook_name(parent_id: str) -> str:
     idx = await _build_index()
     item = idx.get(parent_id)
     return item["title"] if item else parent_id[:8]
+
+
+async def _note_tags_map() -> dict[str, list[str]]:
+    idx = await _build_index()
+    result: dict[str, list[str]] = {}
+    for item in idx.values():
+        if item["type"] != TYPE_NOTE_TAG:
+            continue
+        note_id = item["metadata"].get("note_id")
+        tag = idx.get(item["metadata"].get("tag_id"))
+        if note_id and tag:
+            result.setdefault(note_id, []).append(tag["title"])
+    return result
 
 
 # -- Resource helpers --
@@ -669,6 +687,31 @@ async def create_notebook(title: str, parent_id: str = "") -> str:
 
 
 @mcp.tool()
+async def get_or_create_notebook(path: str) -> str:
+    """Resolve a "/"-separated notebook path, creating any missing levels.
+
+    Args:
+        path: Notebook path, e.g. "runetree_infra/Services/OpenClaw"
+    """
+    await _build_index(force=True)
+    parent_id = ""
+    created = []
+    for name in [p.strip() for p in path.split("/") if p.strip()]:
+        match = next((v for v in _index.values() if v["type"] == TYPE_FOLDER
+                      and v["parent_id"] == parent_id and v["title"] == name), None)
+        if match:
+            parent_id = match["id"]
+            continue
+        nb_id = uuid.uuid4().hex
+        share_id = await _parent_share_id(parent_id)
+        await _put_item(nb_id, _folder_template(nb_id, name, parent_id, _now(), share_id))
+        parent_id = nb_id
+        created.append(name)
+    suffix = f" — created: {', '.join(created)}" if created else " — all existed"
+    return f"Notebook path **{path}** ready (leaf ID: `{parent_id}`){suffix}"
+
+
+@mcp.tool()
 async def delete_notebook(notebook_id: str, force: bool = False) -> str:
     """Delete a notebook. Refuses if non-empty unless force=True.
 
@@ -711,16 +754,21 @@ async def delete_notebook(notebook_id: str, force: bool = False) -> str:
 # -- Notes --
 
 @mcp.tool()
-async def list_notes(notebook_id: Optional[str] = None, limit: int = 50) -> str:
-    """List notes, optionally filtered by notebook.
+async def list_notes(notebook_id: Optional[str] = None, limit: int = 50, tag: Optional[str] = None) -> str:
+    """List notes, optionally filtered by notebook and/or tag.
 
     Args:
         notebook_id: Filter by notebook ID (optional)
         limit: Max notes to return (default 50)
+        tag: Filter by tag name (optional)
     """
     notes = await _get_items_by_type(TYPE_NOTE)
     if notebook_id:
         notes = [n for n in notes if n["parent_id"] == notebook_id]
+    note_tags = await _note_tags_map()
+    if tag:
+        wanted = tag.lower()
+        notes = [n for n in notes if any(t.lower() == wanted for t in note_tags.get(n["id"], []))]
     notes.sort(key=lambda x: x["updated_time"], reverse=True)
     notes = notes[:limit]
 
@@ -729,38 +777,68 @@ async def list_notes(notebook_id: Optional[str] = None, limit: int = 50) -> str:
     lines = [f"Notes ({len(notes)})\n"]
     for note in notes:
         nb_name = await _notebook_name(note["parent_id"])
+        tags = note_tags.get(note["id"], [])
+        tagstr = f" [{', '.join('#' + t for t in tags)}]" if tags else ""
         todo = "[todo] " if note["is_todo"] else ""
         preview = note["body"][:80].replace("\n", " ") if note["body"] else ""
         lines.append(
             f"- {todo}**{note['title']}** `{note['id']}`\n"
-            f"  {nb_name} | {note['updated_time'][:10]}\n"
+            f"  {nb_name} | {note['updated_time'][:10]}{tagstr}\n"
             f"  _{preview}{'...' if len(note['body']) > 80 else ''}_"
         )
     return "\n".join(lines)
 
 
 @mcp.tool()
-async def search_notes(query: str, limit: int = 20) -> str:
-    """Search notes by text in title or body.
+async def search_notes(query: str, limit: int = 20, scope: str = "all",
+                       notebook_id: Optional[str] = None, tag: Optional[str] = None) -> str:
+    """Search notes by text. All query terms must match (AND).
 
     Args:
-        query: Search string
+        query: Space-separated terms; a note must contain all of them
         limit: Max results (default 20)
+        scope: Where to match — "title", "body", or "all" (default)
+        notebook_id: Restrict to a notebook (optional)
+        tag: Restrict to notes carrying this tag name (optional)
     """
-    q = query.lower()
+    terms = query.lower().split()
     notes = await _get_items_by_type(TYPE_NOTE)
-    results = [n for n in notes if q in n["title"].lower() or q in n["body"].lower()][:limit]
+    if notebook_id:
+        notes = [n for n in notes if n["parent_id"] == notebook_id]
+
+    note_tags = await _note_tags_map()
+    if tag:
+        wanted = tag.lower()
+        notes = [n for n in notes if any(t.lower() == wanted for t in note_tags.get(n["id"], []))]
+
+    def fields(n):
+        title, body = n["title"].lower(), (n["body"] or "").lower()
+        if scope == "title":
+            return title, ""
+        if scope == "body":
+            return "", body
+        return title, body
+
+    def score(n):
+        title, body = fields(n)
+        return sum(3 if t in title else 1 for t in terms if t in title or t in body)
+
+    results = [n for n in notes if all(t in " ".join(fields(n)) for t in terms)]
+    results.sort(key=lambda n: (score(n), n["updated_time"]), reverse=True)
+    results = results[:limit]
 
     if not results:
         return f"No notes matching '{query}'."
     lines = [f"Search '{query}' ({len(results)} results)\n"]
     for note in results:
         nb_name = await _notebook_name(note["parent_id"])
-        preview = note["body"][:120].replace("\n", " ")
+        tags = note_tags.get(note["id"], [])
+        tagstr = f" [{', '.join('#' + t for t in tags)}]" if tags else ""
+        preview = (note["body"] or "")[:120].replace("\n", " ")
         lines.append(
             f"- **{note['title']}** `{note['id']}`\n"
-            f"  {nb_name} | {note['updated_time'][:10]}\n"
-            f"  _{preview}{'...' if len(note['body']) > 120 else ''}_"
+            f"  {nb_name} | {note['updated_time'][:10]}{tagstr}\n"
+            f"  _{preview}{'...' if len(note['body'] or '') > 120 else ''}_"
         )
     return "\n".join(lines)
 
