@@ -72,6 +72,85 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _now_ms() -> int:
+    """Current time as integer epoch milliseconds (Joplin's raw todo_* format)."""
+    return int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    """Best-effort int from Joplin metadata: tolerate '', None, and junk."""
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def _ms_to_date(ms: int) -> str:
+    """Render an epoch-ms value as a UTC YYYY-MM-DD date."""
+    return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _parse_due_ms(due: str) -> int:
+    """Parse YYYY-MM-DD or a full ISO-8601 timestamp to epoch ms; '' -> 0 (unset).
+
+    Bare dates are interpreted as UTC midnight. Raises ValueError on junk.
+    """
+    due = due.strip()
+    if not due:
+        return 0
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", due):
+        dt = datetime.datetime.strptime(due, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+    else:
+        dt = datetime.datetime.fromisoformat(due.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _todo_due_value(note: dict) -> int:
+    """todo_due (epoch ms, 0 = unset), tolerant of stale caches lacking the field."""
+    return _coerce_int(note.get("todo_due", note.get("metadata", {}).get("todo_due", 0)))
+
+
+def _todo_completed_value(note: dict) -> int:
+    """todo_completed (epoch ms, 0 = open), tolerant of stale caches lacking the field."""
+    return _coerce_int(note.get("todo_completed", note.get("metadata", {}).get("todo_completed", 0)))
+
+
+def _todo_marker(note: dict) -> str:
+    """Plain-ASCII to-do marker: '' | '[todo]' [ (due DATE)] [ OVERDUE] | '[done DATE]'."""
+    if not note.get("is_todo"):
+        return ""
+    completed = _todo_completed_value(note)
+    if completed:
+        return f"[done {_ms_to_date(completed)}]"
+    marker = "[todo]"
+    due = _todo_due_value(note)
+    if due:
+        marker += f" (due {_ms_to_date(due)})"
+        if due < _now_ms():
+            marker += " OVERDUE"
+    return marker
+
+
+def _filter_by_todo(notes: list[dict], todo: Optional[str]) -> tuple[list[dict], Optional[str]]:
+    """Filter notes by to-do state. Returns (filtered, error); error is None on success.
+
+    todo: None (no filter), 'all' (any to-do), 'open' (uncompleted), 'done' (completed).
+    """
+    if todo is None:
+        return notes, None
+    key = todo.lower()
+    if key not in ("all", "open", "done"):
+        return notes, "todo must be 'all', 'open', or 'done'."
+    notes = [n for n in notes if n["is_todo"]]
+    if key == "open":
+        notes = [n for n in notes if not _todo_completed_value(n)]
+    elif key == "done":
+        notes = [n for n in notes if _todo_completed_value(n)]
+    return notes, None
+
+
 
 # -- HTTP client & auth --
 
@@ -179,6 +258,8 @@ def _parse_joplin_item(raw: str) -> dict:
         "parent_id": metadata.get("parent_id", ""),
         "type": int(metadata.get("type_", "0")),
         "is_todo": metadata.get("is_todo", "0") == "1",
+        "todo_due": _coerce_int(metadata.get("todo_due", 0)),
+        "todo_completed": _coerce_int(metadata.get("todo_completed", 0)),
         "created_time": metadata.get("created_time", ""),
         "updated_time": metadata.get("updated_time", ""),
         "metadata": metadata,
@@ -439,7 +520,8 @@ async def _download_resource(resource_id: str) -> tuple[bytes, str, str]:
 
 
 def _format_note_header(parsed: dict, nb_name: str) -> str:
-    todo = " [todo]" if parsed["is_todo"] else ""
+    marker = _todo_marker(parsed)
+    todo = f" {marker}" if marker else ""
     refs = _find_resource_refs(parsed["body"])
     res_info = f"\nResources: {len(refs)}" if refs else ""
     return (
@@ -500,7 +582,8 @@ async def _parent_share_id(parent_id: str) -> str:
         return ""
 
 
-def _note_template(note_id: str, title: str, body: str, notebook_id: str, now: str, share_id: str = "") -> str:
+def _note_template(note_id: str, title: str, body: str, notebook_id: str, now: str,
+                   share_id: str = "", is_todo: bool = False, due_ms: int = 0) -> str:
     return f"""{title}
 
 {body}
@@ -515,8 +598,8 @@ longitude: 0.00000000
 altitude: 0.0000
 author: 
 source_url: 
-is_todo: 0
-todo_due: 0
+is_todo: {1 if is_todo else 0}
+todo_due: {due_ms}
 todo_completed: 0
 source: joplin-mcp
 source_application: joplin-mcp
@@ -663,7 +746,8 @@ async def get_notebook(notebook_id: str) -> str:
 
     lines.append(f"\n### Notes ({len(notes)})")
     for note in notes:
-        todo = "[todo] " if note["is_todo"] else ""
+        marker = _todo_marker(note)
+        todo = f"{marker} " if marker else ""
         preview = note["body"][:80].replace("\n", " ") if note["body"] else ""
         lines.append(f"- {todo}**{note['title']}** `{note['id']}`\n  _{preview}{'...' if len(note['body']) > 80 else ''}_")
     if not notes:
@@ -754,13 +838,16 @@ async def delete_notebook(notebook_id: str, force: bool = False) -> str:
 # -- Notes --
 
 @mcp.tool()
-async def list_notes(notebook_id: Optional[str] = None, limit: int = 50, tag: Optional[str] = None) -> str:
+async def list_notes(notebook_id: Optional[str] = None, limit: int = 50, tag: Optional[str] = None,
+                     todo: Optional[str] = None) -> str:
     """List notes, optionally filtered by notebook and/or tag.
 
     Args:
         notebook_id: Filter by notebook ID (optional)
         limit: Max notes to return (default 50)
         tag: Filter by tag name (optional)
+        todo: Filter by to-do state: 'all' (any to-do), 'open' (uncompleted),
+            'done' (completed), or omit for no filtering (optional)
     """
     notes = await _get_items_by_type(TYPE_NOTE)
     if notebook_id:
@@ -769,6 +856,9 @@ async def list_notes(notebook_id: Optional[str] = None, limit: int = 50, tag: Op
     if tag:
         wanted = tag.lower()
         notes = [n for n in notes if any(t.lower() == wanted for t in note_tags.get(n["id"], []))]
+    notes, err = _filter_by_todo(notes, todo)
+    if err:
+        return err
     notes.sort(key=lambda x: x["updated_time"], reverse=True)
     notes = notes[:limit]
 
@@ -779,7 +869,8 @@ async def list_notes(notebook_id: Optional[str] = None, limit: int = 50, tag: Op
         nb_name = await _notebook_name(note["parent_id"])
         tags = note_tags.get(note["id"], [])
         tagstr = f" [{', '.join('#' + t for t in tags)}]" if tags else ""
-        todo = "[todo] " if note["is_todo"] else ""
+        marker = _todo_marker(note)
+        todo = f"{marker} " if marker else ""
         preview = note["body"][:80].replace("\n", " ") if note["body"] else ""
         lines.append(
             f"- {todo}**{note['title']}** `{note['id']}`\n"
@@ -937,18 +1028,31 @@ async def export_note(note_id: str) -> str:
 
 
 @mcp.tool()
-async def create_note(title: str, body: str, notebook_id: str = "") -> str:
+async def create_note(title: str, body: str, notebook_id: str = "",
+                      is_todo: bool = False, due: Optional[str] = None) -> str:
     """Create a new note.
 
     Args:
         title: Note title
         body: Note body in Markdown
         notebook_id: Parent notebook ID (optional)
+        is_todo: Create the note as a to-do (optional, default False)
+        due: Due date as YYYY-MM-DD or a full ISO-8601 timestamp; setting it
+            implies is_todo. Bare dates are UTC midnight (optional)
     """
+    due_ms = 0
+    if due:
+        try:
+            due_ms = _parse_due_ms(due)
+        except ValueError:
+            return f"Invalid due date: '{due}'. Use YYYY-MM-DD or an ISO-8601 timestamp."
+    is_todo = is_todo or bool(due_ms)
     note_id = uuid.uuid4().hex
     share_id = await _parent_share_id(notebook_id)
-    await _put_item(note_id, _note_template(note_id, title, body, notebook_id, _now(), share_id))
-    return f"Note created: **{title}** (ID: `{note_id}`)"
+    await _put_item(note_id, _note_template(note_id, title, body, notebook_id, _now(),
+                                            share_id, is_todo=is_todo, due_ms=due_ms))
+    suffix = " (to-do)" if is_todo else ""
+    return f"Note created: **{title}**{suffix} (ID: `{note_id}`)"
 
 
 @mcp.tool()
@@ -985,6 +1089,84 @@ async def update_note(
     content = f"{new_title}\n\n{new_body}\n\n" + "\n".join(f"{k}: {v}" for k, v in meta.items())
     await _put_item(note_id, content)
     return f"Note updated: **{new_title}** (ID: `{note_id}`)"
+
+
+@mcp.tool()
+async def set_todo(
+    note_id: str,
+    is_todo: Optional[bool] = None,
+    completed: Optional[bool] = None,
+    due: Optional[str] = None,
+) -> str:
+    """Set or clear a note's to-do state, completion, and due date.
+
+    Args:
+        note_id: The note ID to modify
+        is_todo: Make the note a to-do (True) or a plain note (False). Setting
+            False also clears the due date and completion. (optional)
+        completed: Mark the to-do done (True) or reopen it (False). Completing a
+            note also forces it to be a to-do. (optional)
+        due: Due date as YYYY-MM-DD or a full ISO-8601 timestamp; "" clears it.
+            Setting a due date also forces the note to be a to-do. Bare dates are
+            interpreted as UTC midnight. (optional)
+    """
+    err = _validate_id(note_id, "note ID")
+    if err:
+        return err
+    if is_todo is None and completed is None and due is None:
+        return "Provide at least one of is_todo, completed, or due to change."
+
+    # Parse due up front so an invalid value fails before any write.
+    due_ms = None
+    if due is not None:
+        try:
+            due_ms = _parse_due_ms(due)
+        except ValueError:
+            return f"Invalid due date: '{due}'. Use YYYY-MM-DD, an ISO-8601 timestamp, or '' to clear."
+
+    resp = await _api("GET", f"/api/items/root:/{note_id}.md:/content")
+    parsed = _parse_joplin_item(resp.text)
+    if parsed["type"] != TYPE_NOTE:
+        return f"Item {note_id} is not a note."
+
+    now = _now()
+    meta = parsed["metadata"]
+    meta["updated_time"] = now
+    meta["user_updated_time"] = now
+
+    changes = []
+    if due is not None:
+        meta["todo_due"] = due_ms
+        if due_ms:
+            meta["is_todo"] = 1
+            changes.append(f"due set to {_ms_to_date(due_ms)}")
+        else:
+            changes.append("due cleared")
+
+    if completed is not None:
+        if completed:
+            done_ms = _now_ms()
+            meta["todo_completed"] = done_ms
+            meta["is_todo"] = 1
+            changes.append(f"marked done ({_ms_to_date(done_ms)})")
+        else:
+            meta["todo_completed"] = 0
+            changes.append("reopened")
+
+    # Applied last: converting to a plain note overrides the flags above.
+    if is_todo is not None:
+        if is_todo:
+            meta["is_todo"] = 1
+            changes.append("marked as to-do")
+        else:
+            meta["is_todo"] = 0
+            meta["todo_due"] = 0
+            meta["todo_completed"] = 0
+            changes.append("converted to plain note")
+
+    content = f"{parsed['title']}\n\n{parsed['body']}\n\n" + "\n".join(f"{k}: {v}" for k, v in meta.items())
+    await _put_item(note_id, content)
+    return f"Note updated: **{parsed['title']}** — {', '.join(changes)} (ID: `{note_id}`)"
 
 
 @mcp.tool()
@@ -1049,15 +1231,19 @@ async def get_all_notes(
     order_dir: str = "desc",
     page: int = 1,
     limit: int = 50,
+    todo: Optional[str] = None,
 ) -> str:
     """Get all notes with optional filtering, pagination, and sorting.
 
     Args:
         notebook_id: Filter by notebook ID (optional)
-        order_by: Sort field: updated_time, created_time, title (default: updated_time)
+        order_by: Sort field: updated_time, created_time, title, todo_due,
+            todo_completed (default: updated_time)
         order_dir: Sort direction: asc or desc (default: desc)
         page: Page number starting from 1 (default: 1)
         limit: Notes per page, max 100 (default: 50)
+        todo: Filter by to-do state: 'all' (any to-do), 'open' (uncompleted),
+            'done' (completed), or omit for no filtering (optional)
     """
     if notebook_id:
         err = _validate_id(notebook_id, "notebook ID")
@@ -1069,8 +1255,9 @@ async def get_all_notes(
     order_dir = order_dir.lower()
     if order_dir not in ("asc", "desc"):
         return "order_dir must be 'asc' or 'desc'."
-    if order_by not in ("updated_time", "created_time", "title"):
-        return "order_by must be 'updated_time', 'created_time', or 'title'."
+    if order_by not in ("updated_time", "created_time", "title", "todo_due", "todo_completed"):
+        return ("order_by must be 'updated_time', 'created_time', 'title', "
+                "'todo_due', or 'todo_completed'.")
 
     notes = await _get_items_by_type(TYPE_NOTE)
     if notebook_id:
@@ -1080,9 +1267,19 @@ async def get_all_notes(
             return f"Notebook {notebook_id} not found."
         notes = [n for n in notes if n["parent_id"] == notebook_id]
 
+    notes, err = _filter_by_todo(notes, todo)
+    if err:
+        return err
+
     reverse = order_dir == "desc"
     if order_by == "title":
         notes.sort(key=lambda x: x["title"].lower(), reverse=reverse)
+    elif order_by in ("todo_due", "todo_completed"):
+        valfn = _todo_due_value if order_by == "todo_due" else _todo_completed_value
+        # Unset (0) values always sort last, regardless of direction.
+        present = sorted((n for n in notes if valfn(n) != 0), key=valfn, reverse=reverse)
+        absent = [n for n in notes if valfn(n) == 0]
+        notes = present + absent
     else:
         notes.sort(key=lambda x: x.get(order_by, ""), reverse=reverse)
 
@@ -1099,7 +1296,8 @@ async def get_all_notes(
 
     for i, note in enumerate(page_notes, start=start + 1):
         nb_name = await _notebook_name(note["parent_id"])
-        todo = "[todo] " if note["is_todo"] else ""
+        marker = _todo_marker(note)
+        todo = f"{marker} " if marker else ""
         preview = note["body"][:80].replace("\n", " ") if note["body"] else ""
         lines.append(
             f"{i}. {todo}**{note['title']}** `{note['id']}`\n"

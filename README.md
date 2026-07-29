@@ -21,15 +21,16 @@
 | `get_or_create_notebook` | Resolve a `/`-separated notebook path, creating missing levels |
 | `update_notebook` | Rename or move a notebook (with circular reference check) |
 | `delete_notebook` | Delete a notebook (with optional force for non-empty) |
-| `list_notes` | List notes, optionally filtered by notebook and/or tag |
-| `get_all_notes` | Get all notes with pagination, sorting, and notebook filter |
+| `list_notes` | List notes, optionally filtered by notebook, tag, and/or to-do state |
+| `get_all_notes` | Get all notes with pagination, sorting (incl. `todo_due`/`todo_completed`), notebook and to-do filters |
 | `search_notes` | Search notes (multi-term AND) with scope and notebook/tag filters |
 | `get_note` | Get note text (resource references replaced with names) |
 | `get_notes_batch` | Read multiple notes at once (up to 50, parallel) |
 | `get_note_full` | Get note with all resources embedded as base64 |
-| `create_note` | Create a new note |
+| `create_note` | Create a new note (optionally as a to-do with a due date) |
 | `export_note` | Export note as markdown with resources as named base64 blocks |
 | `update_note` | Update note title, body, or move to another notebook |
+| `set_todo` | Set/clear a note's to-do state, completion, and due date |
 | `delete_note` | Delete a note |
 | `list_tags` | List all tags |
 | `create_tag` | Create a new tag |
