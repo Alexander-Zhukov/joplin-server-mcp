@@ -219,6 +219,19 @@ async def _put_item(item_id: str, content: str):
         _pending_puts.add(parsed["id"])
 
 
+async def _put_note(note_id: str, title: str, body: str, meta: dict) -> None:
+    """Write a note back with refreshed timestamps.
+
+    Metadata key order is preserved, so the serialized item stays identical
+    apart from the fields that actually changed.
+    """
+    now = _now()
+    meta["updated_time"] = now
+    meta["user_updated_time"] = now
+    content = f"{title}\n\n{body}\n\n" + "\n".join(f"{k}: {v}" for k, v in meta.items())
+    await _put_item(note_id, content)
+
+
 # -- Joplin item parsing --
 
 def _parse_joplin_item(raw: str) -> dict:
@@ -561,6 +574,187 @@ async def _download_refs(resource_refs: list[str]) -> list[tuple[str, Optional[b
         except Exception:
             return rid, None, "", ""
     return await asyncio.gather(*[_dl(rid) for rid in resource_refs])
+
+
+# -- Note body editing --
+#
+# Partial edits are resolved server-side: a caller sends only the fragment it
+# wants added or changed, never the surrounding body. That keeps large notes
+# cheap to edit and makes it impossible to corrupt untouched text (including
+# `:/resource` references, which the read tools render as human-readable names).
+
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(\S.*?)[ \t]*$")
+
+
+def _headings(body: str) -> list[dict]:
+    """Markdown headings outside fenced code blocks, in document order.
+
+    Each entry carries level, title, line (1-based), start (offset of the
+    heading line) and content_start (offset just past that line).
+    """
+    result: list[dict] = []
+    offset = 0
+    fence = ""
+    for lineno, line in enumerate(body.split("\n"), start=1):
+        stripped = line.strip()
+        if fence:
+            if stripped.startswith(fence):
+                fence = ""
+        elif stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = stripped[:3]
+        else:
+            m = _HEADING_RE.match(line)
+            if m:
+                result.append({
+                    "level": len(m.group(1)),
+                    "title": m.group(2).strip(),
+                    "line": lineno,
+                    "start": offset,
+                    "content_start": min(offset + len(line) + 1, len(body)),
+                })
+        offset += len(line) + 1
+    return result
+
+
+def _section_end(heads: list[dict], index: int, body_len: int) -> int:
+    """Offset where a section ends: at the next heading of the same or higher level."""
+    level = heads[index]["level"]
+    for nxt in heads[index + 1:]:
+        if nxt["level"] <= level:
+            return nxt["start"]
+    return body_len
+
+
+def _outline(body: str) -> list[dict]:
+    """Headings annotated with the size of the span they own (subsections included)."""
+    heads = _headings(body)
+    for i, head in enumerate(heads):
+        head["chars"] = _section_end(heads, i, len(body)) - head["start"]
+    return heads
+
+
+def _find_section(body: str, section: str) -> dict:
+    """Resolve a section reference to a span, or raise ValueError explaining why not.
+
+    Accepts bare heading text ("Hosts") or the full line ("## Hosts"); when the
+    hashes are given the level must match too. Matching is exact, then
+    case-insensitive, then a unique case-insensitive substring.
+    """
+    heads = _headings(body)
+    if not heads:
+        raise ValueError("Note has no markdown headings; omit `section` to edit the whole body.")
+
+    wanted = section.strip()
+    level = 0
+    m = re.match(r"^(#{1,6})[ \t]*", wanted)
+    if m:
+        level = len(m.group(1))
+        wanted = wanted[m.end():].strip()
+    if not wanted:
+        raise ValueError(f"Invalid section reference: '{section}' (expected e.g. 'Hosts' or '## Hosts').")
+
+    def pick(match) -> list[int]:
+        return [i for i, h in enumerate(heads)
+                if (not level or h["level"] == level) and match(h["title"])]
+
+    found = (pick(lambda t: t == wanted)
+             or pick(lambda t: t.lower() == wanted.lower())
+             or pick(lambda t: wanted.lower() in t.lower()))
+
+    if not found:
+        listing = ", ".join(f"'{h['title']}'" for h in heads[:30])
+        more = f" (+{len(heads) - 30} more, see get_note_outline)" if len(heads) > 30 else ""
+        raise ValueError(f"Section '{section}' not found. Headings: {listing}{more}.")
+    if len(found) > 1:
+        where = "; ".join(f"line {heads[i]['line']}: {'#' * heads[i]['level']} {heads[i]['title']}"
+                         for i in found[:10])
+        raise ValueError(f"Section '{section}' is ambiguous ({len(found)} matches): {where}. "
+                         "Give the full heading text with its '#' prefix, or use replace_in_note.")
+
+    head = dict(heads[found[0]])
+    head["end"] = _section_end(heads, found[0], len(body))
+    return head
+
+
+def _section_label(head: dict) -> str:
+    return f"'{'#' * head['level']} {head['title']}' (line {head['line']})"
+
+
+def _splice(body: str, start: int, end: int, text: str,
+            position: str, separator: str) -> tuple[str, int]:
+    """Insert `text` at the start or end of the body[start:end] span.
+
+    Returns the new body and the offset the inserted text landed at. Blank-line
+    padding is normalised inside the touched span only.
+    """
+    before, segment, after = body[:start], body[start:end], body[end:]
+    text, inner = text.strip("\n"), segment.strip("\n")
+    lead = "\n" if before and not before.endswith("\n\n") else ""
+    if position == "start":
+        merged = f"{text}{separator}{inner}" if inner else text
+        at = len(before) + len(lead)
+    else:
+        merged = f"{inner}{separator}{text}" if inner else text
+        at = len(before) + len(lead) + len(merged) - len(text)
+    tail = "\n\n" if after else ""
+    return f"{before}{lead}{merged}{tail}{after}", at
+
+
+def _line_of(body: str, offset: int) -> int:
+    return body.count("\n", 0, max(offset, 0)) + 1
+
+
+def _context_lines(body: str, offset: int, radius: int = 4) -> str:
+    """Numbered lines around `offset`, so a caller can see what a write actually did."""
+    lines = body.split("\n")
+    target = _line_of(body, offset) - 1
+    lo, hi = max(0, target - radius), min(len(lines), target + radius + 1)
+    width = len(str(hi))
+    out = []
+    for i in range(lo, hi):
+        text = lines[i] if len(lines[i]) <= 200 else lines[i][:197] + "..."
+        out.append(f"{str(i + 1).rjust(width)} | {text}")
+    return "\n".join(out)
+
+
+def _edit_report(action: str, parsed: dict, old_body: str, new_body: str,
+                 focus: int, detail: str, dry_run: bool) -> str:
+    """Confirm a body edit: before/after counts plus the changed region."""
+    old_lines, new_lines = old_body.count("\n") + 1, new_body.count("\n") + 1
+    prefix = "DRY RUN (nothing written) — " if dry_run else ""
+    return (
+        f"{prefix}{action}: **{parsed['title']}** (ID: `{parsed['id']}`)\n"
+        f"{detail}\n"
+        f"Chars {len(old_body)} -> {len(new_body)} ({len(new_body) - len(old_body):+}), "
+        f"lines {old_lines} -> {new_lines} ({new_lines - old_lines:+}), "
+        f"headings {len(_headings(old_body))} -> {len(_headings(new_body))}\n\n"
+        f"Context around line {_line_of(new_body, focus)}:\n"
+        f"```\n{_context_lines(new_body, focus)}\n```"
+    )
+
+
+async def _apply_body_edit(note_id: str, action: str, transform, dry_run: bool) -> str:
+    """Fetch a note, run transform(body) -> (new_body, focus, detail), write, report.
+
+    `transform` raises ValueError to reject the edit (bad anchor, ambiguous
+    section); returning the body unchanged reports a no-op instead of writing.
+    """
+    err = _validate_id(note_id, "note ID")
+    if err:
+        return err
+    try:
+        parsed = await _fetch_note(note_id)
+        old_body = parsed["body"]
+        new_body, focus, detail = transform(old_body)
+        if new_body == old_body:
+            return f"No change ({detail}): **{parsed['title']}** (ID: `{note_id}`)"
+        if not dry_run:
+            await _put_note(note_id, parsed["title"], new_body, parsed["metadata"])
+        return _edit_report(action, parsed, old_body, new_body, focus, detail, dry_run)
+    except ValueError as e:
+        return str(e)
+    except httpx.HTTPStatusError as e:
+        return f"Note {note_id} not found." if e.response.status_code == 404 else str(e)
 
 
 # -- Joplin item templates --
@@ -935,8 +1129,37 @@ async def search_notes(query: str, limit: int = 20, scope: str = "all",
 
 
 @mcp.tool()
-async def get_note(note_id: str) -> str:
+async def get_note(note_id: str, raw: bool = False) -> str:
     """Get note text content (without resource files). Use get_note_full for embedded resources.
+
+    Args:
+        note_id: The Joplin note ID
+        raw: Return the body verbatim — no header, `:/<id>` resource references
+            left intact — so it can be copied as an exact anchor for replace_in_note
+    """
+    err = _validate_id(note_id, "note ID")
+    if err:
+        return err
+    try:
+        parsed = await _fetch_note(note_id)
+        if raw:
+            return parsed["body"]
+        nb_name = await _notebook_name(parsed["parent_id"])
+        await _ensure_resource_index()
+        return _format_note_header(parsed, nb_name) + _replace_resource_refs(parsed["body"])
+    except ValueError as e:
+        return str(e)
+    except httpx.HTTPStatusError as e:
+        return f"Note {note_id} not found." if e.response.status_code == 404 else str(e)
+
+
+@mcp.tool()
+async def get_note_outline(note_id: str) -> str:
+    """Map a note's structure: headings with line numbers and sizes.
+
+    A cheap way to navigate a large note before editing it — pick a heading from
+    here and hand it to append_to_note or replace_section instead of reading the
+    whole body. Sizes cover each heading's span, subsections included.
 
     Args:
         note_id: The Joplin note ID
@@ -946,9 +1169,27 @@ async def get_note(note_id: str) -> str:
         return err
     try:
         parsed = await _fetch_note(note_id)
+        body = parsed["body"]
+        heads = _outline(body)
+        nlines = body.count("\n") + 1
         nb_name = await _notebook_name(parsed["parent_id"])
-        await _ensure_resource_index()
-        return _format_note_header(parsed, nb_name) + _replace_resource_refs(parsed["body"])
+        lines = [
+            f"# {parsed['title']} — outline",
+            f"Notebook: {nb_name} | Updated: {parsed['updated_time']} | ID: `{parsed['id']}`",
+            f"Body: {len(body)} chars, {nlines} lines, {len(heads)} headings",
+        ]
+        if not heads:
+            return "\n".join(lines) + "\n\nNo markdown headings — edit it with append_to_note or replace_in_note."
+
+        width = max(len(str(h["line"])) for h in heads)
+        lines.append("\n```")
+        lines.append(f"{'line'.rjust(width)}  {'chars'.rjust(7)}  heading")
+        for h in heads:
+            indent = "  " * (h["level"] - 1)
+            lines.append(f"{str(h['line']).rjust(width)}  {str(h['chars']).rjust(7)}  "
+                         f"{indent}{'#' * h['level']} {h['title']}")
+        lines.append("```")
+        return "\n".join(lines)
     except ValueError as e:
         return str(e)
     except httpx.HTTPStatusError as e:
@@ -1062,12 +1303,16 @@ async def update_note(
     body: Optional[str] = None,
     notebook_id: Optional[str] = None,
 ) -> str:
-    """Update an existing note.
+    """Update an existing note, replacing the whole body.
+
+    `body` must be the complete new text, so for anything short of a full
+    rewrite prefer append_to_note, replace_in_note or replace_section: they
+    splice server-side and never make you reproduce existing content.
 
     Args:
         note_id: The note ID to update
         title: New title (optional)
-        body: New body (optional)
+        body: New body — replaces the entire body (optional)
         notebook_id: Move to another notebook (optional)
     """
     resp = await _api("GET", f"/api/items/root:/{note_id}.md:/content")
@@ -1077,18 +1322,153 @@ async def update_note(
 
     new_title = title if title is not None else parsed["title"]
     new_body = body if body is not None else parsed["body"]
-    now = _now()
 
     meta = parsed["metadata"]
-    meta["updated_time"] = now
-    meta["user_updated_time"] = now
     if notebook_id is not None:
         meta["parent_id"] = notebook_id
         meta["share_id"] = await _parent_share_id(notebook_id)
 
-    content = f"{new_title}\n\n{new_body}\n\n" + "\n".join(f"{k}: {v}" for k, v in meta.items())
-    await _put_item(note_id, content)
+    await _put_note(note_id, new_title, new_body, meta)
     return f"Note updated: **{new_title}** (ID: `{note_id}`)"
+
+
+@mcp.tool()
+async def append_to_note(
+    note_id: str,
+    text: str,
+    section: Optional[str] = None,
+    position: str = "end",
+    separator: str = "\n\n",
+    if_absent: Optional[str] = None,
+    dry_run: bool = False,
+) -> str:
+    """Add text to a note without resending its existing body.
+
+    The note is read and spliced server-side, so everything already there —
+    including resource links — is preserved byte for byte. Prefer this over
+    update_note whenever you are only adding content: update_note replaces the
+    whole body and therefore requires you to reproduce it exactly.
+
+    Args:
+        note_id: The note ID
+        text: Markdown to insert
+        section: Heading to insert under, e.g. "Hosts" or "## Hosts". Applies to
+            the whole note when omitted (optional)
+        position: "end" (default) or "start" of the note or section
+        separator: Text placed between the existing content and the insert
+            (default: a blank line; pass "\\n" for table rows or list items)
+        if_absent: Skip the write when this string is already in the body — an
+            idempotency guard for re-runs (optional)
+        dry_run: Report the change and its context without writing
+    """
+    if position not in ("end", "start"):
+        return "position must be 'end' or 'start'."
+    if not text:
+        return "Nothing to append: `text` is empty."
+
+    def transform(body: str):
+        if if_absent and if_absent in body:
+            return body, 0, f"'{if_absent[:60]}' already present"
+        if section is None:
+            start, end, where = 0, len(body), "the note"
+        else:
+            head = _find_section(body, section)
+            start, end, where = head["content_start"], head["end"], f"section {_section_label(head)}"
+        new_body, at = _splice(body, start, end, text, position, separator)
+        return new_body, at, f"Inserted {len(text)} chars at the {position} of {where}"
+
+    return await _apply_body_edit(note_id, "Appended to", transform, dry_run)
+
+
+@mcp.tool()
+async def replace_in_note(
+    note_id: str,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
+    dry_run: bool = False,
+) -> str:
+    """Replace an exact string inside a note body — a surgical edit.
+
+    Only the fragment crosses the wire; the rest of the note is never rewritten.
+    Refuses to act when `old_text` is missing, or matches more than once without
+    replace_all, so a bad anchor cannot silently mangle a note. Pass an empty
+    `new_text` to delete the fragment.
+
+    Args:
+        note_id: The note ID
+        old_text: Exact text to find — copy it verbatim from get_note(raw=True)
+        new_text: Replacement text ("" deletes the anchor)
+        replace_all: Replace every occurrence instead of demanding a unique match
+        dry_run: Report the change and its context without writing
+    """
+    if not old_text:
+        return "`old_text` must not be empty — use append_to_note to add content."
+
+    def transform(body: str):
+        count = body.count(old_text)
+        if count == 0:
+            hint = ""
+            if old_text.strip() and old_text.strip() in body:
+                hint = (" A whitespace-trimmed version does match, so leading or trailing"
+                        " spaces/newlines differ.")
+            elif "\n" in old_text:
+                first = old_text.strip().split("\n")[0].strip()
+                if first and first in body:
+                    hint = (f" Its first line ('{first[:60]}') is present, so the lines"
+                            " after it differ.")
+            raise ValueError(f"old_text not found in note {note_id}.{hint}"
+                             " Read the note with get_note(raw=True) and copy the anchor verbatim.")
+        if count > 1 and not replace_all:
+            at, lines = -1, []
+            for _ in range(min(count, 10)):
+                at = body.find(old_text, at + 1)
+                lines.append(str(_line_of(body, at)))
+            raise ValueError(f"old_text matches {count} times (lines {', '.join(lines)}). "
+                             "Extend the anchor to make it unique, or pass replace_all=True.")
+
+        at = body.find(old_text)
+        if replace_all:
+            new_body = body.replace(old_text, new_text)
+        else:
+            new_body = body[:at] + new_text + body[at + len(old_text):]
+        verb = "Deleted" if not new_text else "Replaced"
+        hits = count if replace_all else 1
+        return new_body, at, f"{verb} {hits} occurrence(s) of a {len(old_text)}-char anchor"
+
+    return await _apply_body_edit(note_id, "Edited", transform, dry_run)
+
+
+@mcp.tool()
+async def replace_section(note_id: str, section: str, text: str, dry_run: bool = False) -> str:
+    """Replace everything under a heading, keeping the heading line itself.
+
+    Rewrites one section of a large note without resending — or even reading —
+    the rest of it. Pass an empty `text` to empty the section.
+
+    Args:
+        note_id: The note ID
+        section: Heading whose content to replace, e.g. "Hosts" or "## Hosts"
+        text: New Markdown content for that section
+        dry_run: Report the change and its context without writing
+    """
+    def transform(body: str):
+        head = _find_section(body, section)
+        before, after = body[:head["content_start"]], body[head["end"]:]
+        old_len = len(body[head["content_start"]:head["end"]].strip("\n"))
+        inner = text.strip("\n")
+        if inner:
+            lead = "\n" if before and not before.endswith("\n\n") else ""
+            tail = "\n\n" if after else ""
+            new_body = f"{before}{lead}{inner}{tail}{after}"
+            at = len(before) + len(lead)
+        else:
+            gap = "\n" if after else ""
+            new_body, at = f"{before}{gap}{after}", len(before)
+        return (new_body, at,
+                f"Replaced section {_section_label(head)}: {old_len} -> {len(inner)} chars")
+
+    return await _apply_body_edit(note_id, "Section replaced in", transform, dry_run)
 
 
 @mcp.tool()
@@ -1129,11 +1509,7 @@ async def set_todo(
     if parsed["type"] != TYPE_NOTE:
         return f"Item {note_id} is not a note."
 
-    now = _now()
     meta = parsed["metadata"]
-    meta["updated_time"] = now
-    meta["user_updated_time"] = now
-
     changes = []
     if due is not None:
         meta["todo_due"] = due_ms
@@ -1164,8 +1540,7 @@ async def set_todo(
             meta["todo_completed"] = 0
             changes.append("converted to plain note")
 
-    content = f"{parsed['title']}\n\n{parsed['body']}\n\n" + "\n".join(f"{k}: {v}" for k, v in meta.items())
-    await _put_item(note_id, content)
+    await _put_note(note_id, parsed["title"], parsed["body"], meta)
     return f"Note updated: **{parsed['title']}** — {', '.join(changes)} (ID: `{note_id}`)"
 
 
