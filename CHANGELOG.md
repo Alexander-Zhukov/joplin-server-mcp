@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.3.1
+
+### Added
+- `append_to_note`: `position` accepts `before` and `after`, which place the
+  text beside a named section rather than inside it — above its heading, or past
+  its whole span with subsections included. Both require `section`, ignore
+  `separator`, and are strictly additive: no existing byte is rewritten and a
+  blank line is inserted only where the join would otherwise glue the block to
+  its neighbour (an existing wider gap is left alone).
+
+  This completes the set shipped in v0.3.0, which could not express "put this
+  above that section": in a newest-first log whose first heading is preceded by
+  a preamble, `position="start"` lands above the preamble, so the only route was
+  a `replace_in_note` anchored on the heading.
+
 ## v0.3.0
 
 ### Added

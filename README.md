@@ -31,7 +31,7 @@
 | `export_note` | Export note as markdown with resources as named base64 blocks |
 | `update_note` | Update note title, body, or move to another notebook |
 | `get_note_outline` | Map a note's headings with line numbers and section sizes |
-| `append_to_note` | Add text to a note or one of its sections without resending the body |
+| `append_to_note` | Add text inside a note or section, or as a sibling before/after a section |
 | `replace_in_note` | Replace an exact string inside a note body |
 | `replace_section` | Replace everything under a heading |
 | `set_todo` | Set/clear a note's to-do state, completion, and due date |
@@ -59,7 +59,7 @@ tools render as human-readable names — is preserved byte for byte.
 
 ```
 append_to_note(note_id, "| docker-2 | .43 |", section="Hosts", separator="\n")
-append_to_note(note_id, "## 2026-08-26\n\nDeployed.", section="Work Log", position="start")
+append_to_note(note_id, "## 2026-08-26\n\nDeployed.", section="## 2026-08-25", position="before")
 replace_in_note(note_id, "status: draft", "status: final")
 replace_section(note_id, "## Current state", "Rewritten from scratch.")
 ```
@@ -81,6 +81,14 @@ Guard rails:
   higher level. Headings inside fenced code blocks are ignored. An ambiguous or
   missing heading is refused, never guessed. `get_note_outline` lists what is
   available without reading the body.
+- **`position` picks inside or beside.** `"start"` / `"end"` write inside the
+  note or section, joining the existing content with `separator`. `"before"` /
+  `"after"` place the text beside a named section instead — above its heading,
+  or past its whole span with subsections included. Those two require
+  `section`, ignore `separator`, and are strictly additive: no existing byte is
+  rewritten and blank lines appear only where the join needs them. Reach for
+  `"before"` to put a new entry at the top of a newest-first log whose first
+  heading is preceded by a preamble — `"start"` would land above the preamble.
 - **`replace_in_note` demands a unique match.** A missing anchor or an
   unexpected second match is an error, with the mismatching lines reported.
   Use `get_note(raw=True)` to copy an anchor verbatim, or `replace_all=True`

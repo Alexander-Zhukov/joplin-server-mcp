@@ -266,6 +266,52 @@ def test_note_round_trip():
     check(list(again["metadata"])[-1] == "type_", "metadata key order preserved (type_ stays last)")
 
 
+def test_insert_block_before_and_after():
+    """`before`/`after` place a sibling block and must never rewrite existing bytes."""
+    log = "# Work Log\n\nNewest first.\n\n---\n\n\n## 2026-08-26 — b\n\nbbb\n\n## 2026-08-25 — a\n\naaa\n"
+
+    def assert_additive(old, new, cut, label):
+        check(new[:cut] == old[:cut], f"{label}: everything before the cut is byte-identical")
+        check(new.endswith(old[cut:]), f"{label}: everything after the cut is byte-identical")
+        check(len(new) > len(old), f"{label}: the body only grew")
+
+    head = S._find_section(log, "## 2026-08-26 — b")
+    entry = "## 2026-08-26 — newest\n\nnnn"
+    out, at = S._insert_block(log, head["start"], entry)
+    check(out[at:].startswith(entry), "before: offset points at the insert")
+    check(out.index(entry) < out.index("## 2026-08-26 — b"), "before: insert precedes the heading")
+    check("Newest first." in out.split(entry)[0], "before: the preamble stays above the insert")
+    assert_additive(log, out, head["start"], "before")
+    check(len(S._headings(out)) == len(S._headings(log)) + 1, "before: one new heading")
+
+    # An existing blank-line gap is left exactly as it was, not normalised.
+    check(out.split(entry)[0].endswith("---\n\n\n"), "before: the existing gap is untouched",
+          repr(out.split(entry)[0][-8:]))
+
+    nested = "## A\n\naaa\n\n### A1\n\nsub\n\n## B\n\nbbb\n"
+    head = S._find_section(nested, "## A")
+    out, at = S._insert_block(nested, head["end"], "## New\n\nnnn")
+    check(out.index("## New") > out.index("sub"), "after: lands past the subsection")
+    check(out.index("## New") < out.index("## B"), "after: lands before the next same-level heading")
+    assert_additive(nested, out, head["end"], "after")
+
+    tail = S._find_section(nested, "## B")
+    out, at = S._insert_block(nested, tail["end"], "## Last")
+    check(out.rstrip("\n").endswith("## Last"), "after: the final section appends at the very end", repr(out[-20:]))
+    assert_additive(nested, out, tail["end"], "after-last")
+
+    # Blank lines are added only where the join needs them.
+    prose = "prose with no trailing newline"
+    out, at = S._insert_block(prose, len(prose), "X")
+    check(out == "prose with no trailing newline\n\nX", "no trailing newline -> a blank line is added", repr(out))
+    out, at = S._insert_block("line\n", 5, "X")
+    check(out == "line\n\nX", "single newline -> one more is added", repr(out))
+    out, at = S._insert_block("line\n\n", 6, "X")
+    check(out == "line\n\nX", "an existing blank line is enough", repr(out))
+    out, at = S._insert_block("## A\n\naaa\n", 0, "X")
+    check(out == "X\n\n## A\n\naaa\n" and at == 0, "insert at offset 0 needs no lead", repr(out))
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
