@@ -700,6 +700,27 @@ def _splice(body: str, start: int, end: int, text: str,
     return f"{before}{lead}{merged}{tail}{after}", at
 
 
+def _insert_block(body: str, cut: int, text: str) -> tuple[str, int]:
+    """Insert `text` as a standalone block at offset `cut`.
+
+    Strictly additive: nothing already in the body is rewritten, and blank lines
+    are added only where the join would otherwise glue the block to its
+    neighbour. This is what `before`/`after` use, and it is why they are safer
+    than `start`/`end` — those normalise blank-line padding inside the span they
+    edit.
+    """
+    before, after = body[:cut], body[cut:]
+    text = text.strip("\n")
+    if not before or before.endswith("\n\n"):
+        lead = ""
+    elif before.endswith("\n"):
+        lead = "\n"
+    else:
+        lead = "\n\n"
+    tail = "\n\n" if after else ""
+    return f"{before}{lead}{text}{tail}{after}", len(before) + len(lead)
+
+
 def _line_of(body: str, offset: int) -> int:
     return body.count("\n", 0, max(offset, 0)) + 1
 
@@ -1354,21 +1375,37 @@ async def append_to_note(
         text: Markdown to insert
         section: Heading to insert under, e.g. "Hosts" or "## Hosts". Applies to
             the whole note when omitted (optional)
-        position: "end" (default) or "start" of the note or section
-        separator: Text placed between the existing content and the insert
-            (default: a blank line; pass "\\n" for table rows or list items)
+        position: Where the text goes.
+            Inside the section (or note): "end" (default) or "start".
+            Beside a named section, as a sibling: "before" its heading, or
+            "after" its whole span — subsections included. These two require
+            `section`, ignore `separator`, and never rewrite an existing byte,
+            which makes "before" the way to put a new entry at the top of a
+            newest-first log that opens with a preamble.
+        separator: Text placed between the existing content and the insert for
+            "start"/"end" (default: a blank line; pass "\\n" for table rows or
+            list items). Ignored by "before"/"after"
         if_absent: Skip the write when this string is already in the body — an
             idempotency guard for re-runs (optional)
         dry_run: Report the change and its context without writing
     """
-    if position not in ("end", "start"):
-        return "position must be 'end' or 'start'."
+    if position not in ("end", "start", "before", "after"):
+        return "position must be 'end', 'start', 'before' or 'after'."
+    if position in ("before", "after") and section is None:
+        return (f"position '{position}' needs a `section` to sit beside — "
+                "for the whole note use 'start' or 'end'.")
     if not text:
         return "Nothing to append: `text` is empty."
 
     def transform(body: str):
         if if_absent and if_absent in body:
             return body, 0, f"'{if_absent[:60]}' already present"
+        if position in ("before", "after"):
+            head = _find_section(body, section)
+            cut = head["start"] if position == "before" else head["end"]
+            new_body, at = _insert_block(body, cut, text)
+            return (new_body, at,
+                    f"Inserted {len(text)} chars {position} section {_section_label(head)}")
         if section is None:
             start, end, where = 0, len(body), "the note"
         else:
