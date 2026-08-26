@@ -45,6 +45,13 @@
   (integer epoch-ms, `0` = unset) are parsed defensively and tolerate malformed
   or missing metadata without erroring.
 
+### Thanks
+- @paoloviviani for [#7](https://github.com/Alexander-Zhukov/joplin-server-mcp/pull/7)
+  — *Add to-do state: rendering, filters, set_todo, create_note flags*. Joplin's
+  serialized format always carried `todo_due` and `todo_completed`; this server
+  never surfaced them or let a client set them. Everything under to-do state
+  above is their work. Thank you!
+
 ## v0.2.0
 
 ### Added
