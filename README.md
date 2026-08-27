@@ -188,6 +188,16 @@ state) are covered by a dependency-free test suite:
 python tests/test_helpers.py
 ```
 
+## Contributors
+
+- [@paoloviviani](https://github.com/paoloviviani) — to-do state: completion and
+  due dates surfaced and settable, `set_todo`, `create_note` flags, `todo`
+  filters and ordering ([#7](https://github.com/Alexander-Zhukov/joplin-server-mcp/pull/7))
+- [@LasseLegarth](https://github.com/LasseLegarth) — `share_id` inherited from
+  the parent notebook, so notes stay visible to a shared notebook's participants
+  ([#5](https://github.com/Alexander-Zhukov/joplin-server-mcp/pull/5))
+
+
 ## License
 
 [MIT](LICENSE)
