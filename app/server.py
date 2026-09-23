@@ -990,7 +990,7 @@ async def get_or_create_notebook(path: str) -> str:
     """Resolve a "/"-separated notebook path, creating any missing levels.
 
     Args:
-        path: Notebook path, e.g. "runetree_infra/Services/OpenClaw"
+        path: Notebook path, e.g. "Work/Projects/Website"
     """
     await _build_index(force=True)
     parent_id = ""
