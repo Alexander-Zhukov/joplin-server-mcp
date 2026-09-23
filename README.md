@@ -58,7 +58,7 @@ changed, so untouched text — including `:/<resource-id>` links, which the read
 tools render as human-readable names — is preserved byte for byte.
 
 ```
-append_to_note(note_id, "| docker-2 | .43 |", section="Hosts", separator="\n")
+append_to_note(note_id, "| web-1 | 10.0.0.5 |", section="Hosts", separator="\n")
 append_to_note(note_id, "## 2026-08-26\n\nDeployed.", section="## 2026-08-25", position="before")
 replace_in_note(note_id, "status: draft", "status: final")
 replace_section(note_id, "## Current state", "Rewritten from scratch.")
@@ -69,8 +69,8 @@ before and after, and the numbered lines around the change — so the result can
 be verified without re-reading the note:
 
 ```
-Appended to: **01 · Work Log** (ID: `3e8ab15d2f8b40cd9c2e754a7b2db13f`)
-Inserted 745 chars at the start of section '# 01 · Work Log' (line 1)
+Appended to: **Work Log** (ID: `0123456789abcdef0123456789abcdef`)
+Inserted 745 chars at the start of section '# Work Log' (line 1)
 Chars 76141 -> 76887 (+746), lines 1858 -> 1885 (+27), headings 117 -> 118
 ```
 
@@ -111,9 +111,13 @@ Guard rails:
 | `JOPLIN_SERVER_URL` | Yes | — | Joplin Server URL |
 | `JOPLIN_EMAIL` | Yes | — | User email |
 | `JOPLIN_PASSWORD` | Yes | — | User password |
-| `MCP_TRANSPORT` | No | `stdio` | Transport: `stdio` or `sse` |
-| `MCP_HOST` | No | `0.0.0.0` | SSE listen host |
-| `MCP_PORT` | No | `8081` | SSE listen port |
+| `MCP_TRANSPORT` | No | `stdio` (`sse` in the Docker image) | Transport: `stdio`, `sse` or `streamable-http` |
+| `MCP_HOST` | No | `0.0.0.0` | HTTP listen host (`sse` and `streamable-http`) |
+| `MCP_PORT` | No | `8081` | HTTP listen port (`sse` and `streamable-http`) |
+
+`streamable-http` serves the endpoint `/mcp` and is the transport the current
+MCP specification recommends; `sse` (endpoint `/sse`) is the older one, kept as
+the image default for compatibility.
 
 ### Run with Docker
 
@@ -127,11 +131,12 @@ docker run -d \
 ```
 
 The container defaults to SSE transport. The endpoint will be available at `http://localhost:8081/sse`.
+Add `-e MCP_TRANSPORT=streamable-http` to serve `http://localhost:8081/mcp` instead.
 
 ### Run locally (stdio)
 
 ```bash
-pip install mcp httpx
+pip install -r requirements.txt   # mcp, httpx, uvicorn, pinned
 python app/server.py
 ```
 
@@ -143,7 +148,19 @@ docker build -t joplin-mcp .
 
 ## MCP client configuration
 
-### SSE (Docker)
+### Streamable HTTP
+
+```json
+{
+  "mcpServers": {
+    "joplin": {
+      "url": "http://localhost:8081/mcp"
+    }
+  }
+}
+```
+
+### SSE (Docker default)
 
 ```json
 {
@@ -175,7 +192,7 @@ docker build -t joplin-mcp .
 
 ## How it works
 
-The server authenticates with Joplin Server via email/password sessions and builds an in-memory index of all items (notes, notebooks, tags) with a 2-minute TTL cache. Incremental sync compares server-side `updated_time` with cached etags, fetching only changed items (typical refresh: ~5s vs ~35s full rebuild). The index is persisted to disk so container restarts are instant. Resource metadata is loaded lazily on first access. Background refresh keeps the index up to date without blocking requests. All IDs are validated (32-char hex) before API calls.
+The server authenticates with Joplin Server via email/password sessions and builds an in-memory index of all items (notes, notebooks, tags) with a 2-minute TTL cache. Incremental sync compares server-side `updated_time` with cached etags, fetching only changed items (typical refresh: ~5s vs ~35s full rebuild). The index is persisted to `/tmp/joplin_index_cache.json` so a restarted container starts instantly; a recreated one rebuilds it on first use. Resource metadata is loaded lazily on first access. Background refresh keeps the index up to date without blocking requests. All IDs are validated (32-char hex) before API calls.
 
 Joplin's internal serialization format (title + markdown body + metadata block) is parsed and presented as clean structured output.
 
