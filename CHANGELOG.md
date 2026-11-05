@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Multi-user mode (`JOPLIN_MULTI_USER=1`): one server instance serves many
+  Joplin accounts. Each request carries `email:password` in a header
+  (`X-Joplin-Credentials`, configurable with `JOPLIN_CREDENTIALS_HEADER`); a
+  missing header or a failed Joplin login is an HTTP 401, more than 5 failed
+  logins per account in 5 minutes an HTTP 429. Env credentials are not needed
+  and not used in this mode. See the README, including its Limitations.
+- Per-account state (`Account`): session, index, resource index, etags, pending
+  writes, lock and background tasks no longer live in module globals. Idle
+  accounts are evicted after `JOPLIN_ACCOUNT_IDLE_MINUTES` (default 30).
+- On-disk index cache per account in `JOPLIN_CACHE_DIR` (mode 0600, directory
+  0700); `JOPLIN_DISK_CACHE=0` disables it. Single-user mode keeps its
+  `/tmp/joplin_index_cache.json` file.
+- `requirements-dev.txt`, `tests/test_multi_user.py` (pytest, fake Joplin API)
+  and `tests/smoke_multi_user.py`.
+
+### Changed
+- The HTTP transports (`sse`, `streamable-http`) are now served by uvicorn from
+  `server.py` so the credentials middleware can wrap them; endpoints unchanged.
+- Login errors no longer carry the request details, so credentials cannot leak
+  through exception text.
+
 ## v0.3.1
 
 ### Added
