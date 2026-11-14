@@ -109,11 +109,16 @@ Guard rails:
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `JOPLIN_SERVER_URL` | Yes | — | Joplin Server URL |
-| `JOPLIN_EMAIL` | Yes | — | User email |
-| `JOPLIN_PASSWORD` | Yes | — | User password |
+| `JOPLIN_EMAIL` | Yes (single-user) | — | User email |
+| `JOPLIN_PASSWORD` | Yes (single-user) | — | User password |
 | `MCP_TRANSPORT` | No | `stdio` (`sse` in the Docker image) | Transport: `stdio`, `sse` or `streamable-http` |
 | `MCP_HOST` | No | `0.0.0.0` | HTTP listen host (`sse` and `streamable-http`) |
 | `MCP_PORT` | No | `8081` | HTTP listen port (`sse` and `streamable-http`) |
+| `JOPLIN_MULTI_USER` | No | `0` | `1` = take each user's credentials from a request header, see [Multi-user mode](#multi-user-mode) |
+| `JOPLIN_CREDENTIALS_HEADER` | No | `X-Joplin-Credentials` | Multi-user: name of the header carrying `email:password` |
+| `JOPLIN_ACCOUNT_IDLE_MINUTES` | No | `30` | Multi-user: evict an account (index, session, password) after this much idle time |
+| `JOPLIN_DISK_CACHE` | No | `1` | `0` disables the on-disk index cache |
+| `JOPLIN_CACHE_DIR` | No | `/tmp/joplin-cache` | Multi-user: directory of the per-account cache files |
 
 `streamable-http` serves the endpoint `/mcp` and is the transport the current
 MCP specification recommends; `sse` (endpoint `/sse`) is the older one, kept as
@@ -190,9 +195,90 @@ docker build -t joplin-mcp .
 }
 ```
 
+## Multi-user mode
+
+By default one server instance serves one Joplin account (the one in
+`JOPLIN_EMAIL` / `JOPLIN_PASSWORD`). With `JOPLIN_MULTI_USER=1` a single
+instance serves many users: each request carries that user's own Joplin
+credentials in a header, and every tool call runs against that user's account.
+
+### How it works
+
+- The client sends `X-Joplin-Credentials: email:password` with every request
+  (the value is split at the **first** colon, so passwords may contain colons).
+  The header name is configurable with `JOPLIN_CREDENTIALS_HEADER`.
+- An ASGI middleware reads the header, logs in to Joplin Server (or reuses the
+  session it already has for that account) and binds the account to the request.
+  Without the header, or with credentials Joplin rejects, the request is
+  answered with **HTTP 401** before reaching any tool, so clients report
+  "unauthorized" instead of a tool error. More than 5 failed logins for one
+  account within 5 minutes are answered with **429**.
+- Each account has its own state: session, index, resource index and background
+  refresh tasks. Accounts are keyed by `sha256(server URL + lowercased email)`;
+  an account idle for `JOPLIN_ACCOUNT_IDLE_MINUTES` (default 30) is evicted and
+  its background tasks cancelled.
+- `JOPLIN_SERVER_URL` is only read from the environment, never from a header.
+  `JOPLIN_EMAIL` / `JOPLIN_PASSWORD` are not required and are never used in
+  this mode.
+- The index cache on disk is one file per account in `JOPLIN_CACHE_DIR`, named
+  by the account hash, mode `0600` in a `0700` directory, and loaded only after
+  a successful login. `JOPLIN_DISK_CACHE=0` turns it off. The files contain note
+  titles and bodies in clear, so put the directory on storage you trust.
+- Credentials are never logged or put in error messages.
+- Multi-user mode needs an HTTP transport. `streamable-http` is recommended: it
+  runs stateless, so each request is executed with the credentials of that
+  request. With `sse` the account is fixed when the SSE connection is opened.
+- Single-user mode is unchanged: no header is needed, stdio works, and if a
+  credentials header is sent anyway it is ignored (a warning is logged once).
+
+### Docker example
+
+```bash
+docker run -d \
+  -e JOPLIN_SERVER_URL=https://your-joplin-server.example.com \
+  -e JOPLIN_MULTI_USER=1 \
+  -e MCP_TRANSPORT=streamable-http \
+  -v joplin-mcp-cache:/tmp/joplin-cache \
+  -p 127.0.0.1:8081:8081 \
+  alexfail2/joplin-mcp
+```
+
+### Client configuration
+
+Any MCP client that can send a per-user header works, for example a chat
+application whose connector lets each user provide their own key and choose the
+header name:
+
+```json
+{
+  "mcpServers": {
+    "joplin": {
+      "url": "https://joplin-mcp.internal.example.com/mcp",
+      "headers": { "X-Joplin-Credentials": "you@example.com:your_joplin_password" }
+    }
+  }
+}
+```
+
+### Limitations
+
+- Joplin Server has no personal access tokens. Each user's Joplin **password**
+  is therefore sent with every request, and the client has to store it
+  (encrypted in the client, if it supports that).
+- The MCP server holds the password of every active user in memory and logs in
+  to Joplin on their behalf. **A compromise of the server exposes the accounts
+  of all active users.** Run it only on a private network or behind TLS, never
+  on the public internet without TLS.
+- One Joplin Server per instance (`JOPLIN_SERVER_URL`).
+- The index is kept per user in memory, so memory grows with the number of
+  active users; idle accounts are evicted after `JOPLIN_ACCOUNT_IDLE_MINUTES`.
+- There is no revocation separate from Joplin itself: changing the Joplin
+  password is the only way to cut access (an already-open session keeps working
+  until Joplin rejects it).
+
 ## How it works
 
-The server authenticates with Joplin Server via email/password sessions and builds an in-memory index of all items (notes, notebooks, tags) with a 2-minute TTL cache. Incremental sync compares server-side `updated_time` with cached etags, fetching only changed items (typical refresh: ~5s vs ~35s full rebuild). The index is persisted to `/tmp/joplin_index_cache.json` so a restarted container starts instantly; a recreated one rebuilds it on first use. Resource metadata is loaded lazily on first access. Background refresh keeps the index up to date without blocking requests. All IDs are validated (32-char hex) before API calls.
+The server authenticates with Joplin Server via email/password sessions and builds an in-memory index of all items (notes, notebooks, tags) with a 2-minute TTL cache. Incremental sync compares server-side `updated_time` with cached etags, fetching only changed items (typical refresh: ~5s vs ~35s full rebuild). The index is persisted to `/tmp/joplin_index_cache.json` (one file per account in multi-user mode, see above; `JOPLIN_DISK_CACHE=0` disables it) so a restarted container starts instantly; a recreated one rebuilds it on first use. Resource metadata is loaded lazily on first access. Background refresh keeps the index up to date without blocking requests. All IDs are validated (32-char hex) before API calls.
 
 Joplin's internal serialization format (title + markdown body + metadata block) is parsed and presented as clean structured output.
 
@@ -203,6 +289,14 @@ state) are covered by a dependency-free test suite:
 
 ```bash
 python tests/test_helpers.py
+```
+
+The multi-user tests use `pytest` and a fake Joplin API (`tests/fake_joplin.py`):
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+python tests/smoke_multi_user.py 8381   # end-to-end, streamable-http, two users
 ```
 
 ## Contributors

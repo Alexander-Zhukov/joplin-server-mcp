@@ -2,6 +2,10 @@
 
 import asyncio
 import base64
+import collections
+import contextvars
+import hashlib
+import hmac
 from contextlib import asynccontextmanager
 import datetime
 import json
@@ -22,10 +26,30 @@ JOPLIN_SERVER_URL = os.environ.get("JOPLIN_SERVER_URL", "").rstrip("/")
 JOPLIN_EMAIL = os.environ.get("JOPLIN_EMAIL", "")
 JOPLIN_PASSWORD = os.environ.get("JOPLIN_PASSWORD", "")
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Multi-user mode: every request brings its own Joplin credentials in a header.
+# The env credentials are neither required nor used in this mode.
+MULTI_USER = _env_flag("JOPLIN_MULTI_USER", False)
+CREDENTIALS_HEADER = os.environ.get("JOPLIN_CREDENTIALS_HEADER", "X-Joplin-Credentials").strip() \
+    or "X-Joplin-Credentials"
+ACCOUNT_IDLE_SECONDS = float(os.environ.get("JOPLIN_ACCOUNT_IDLE_MINUTES", "30")) * 60
+DISK_CACHE = _env_flag("JOPLIN_DISK_CACHE", True)
+CACHE_DIR = os.environ.get("JOPLIN_CACHE_DIR", "/tmp/joplin-cache")
+LOGIN_MAX_FAILURES = 5
+LOGIN_FAILURE_WINDOW = 300.0
+
 if not JOPLIN_SERVER_URL:
     raise RuntimeError("JOPLIN_SERVER_URL is required")
-if not JOPLIN_EMAIL or not JOPLIN_PASSWORD:
-    raise RuntimeError("JOPLIN_EMAIL and JOPLIN_PASSWORD are required")
+if not MULTI_USER and (not JOPLIN_EMAIL or not JOPLIN_PASSWORD):
+    raise RuntimeError("JOPLIN_EMAIL and JOPLIN_PASSWORD are required "
+                       "(or set JOPLIN_MULTI_USER=1 to take credentials from a request header)")
 
 TYPE_NOTE = 1
 TYPE_FOLDER = 2
@@ -44,18 +68,217 @@ TYPE_NAMES = {
 }
 
 _client: Optional[httpx.AsyncClient] = None
-_session_id: Optional[str] = None
-_index: dict[str, dict] = {}
-_index_ts: float = 0
-_resource_index: dict[str, dict] = {}
-_server_etags: dict[str, str] = {}
-_pending_puts: set[str] = set()
-_resource_index_ready = False
-_index_lock: Optional[asyncio.Lock] = None
 INDEX_TTL = 120
 INDEX_CONCURRENCY = 50
 MAX_RESOURCE_SIZE = 50 * 1024 * 1024
+# Single-user mode keeps its historical cache file; multi-user mode uses one
+# file per account under CACHE_DIR (see Account.cache_path).
 INDEX_CACHE_FILE = "/tmp/joplin_index_cache.json"
+
+
+# -- Accounts --
+
+class AuthError(Exception):
+    """Joplin refused the credentials (or none were supplied)."""
+
+
+class RateLimited(Exception):
+    """Too many failed logins for this account."""
+
+
+def _account_key(email: str) -> str:
+    return hashlib.sha256(f"{JOPLIN_SERVER_URL}\n{email.strip().lower()}".encode("utf-8")).hexdigest()
+
+
+class Account:
+    """All per-user state: credentials, session, index and background tasks."""
+
+    def __init__(self, email: str, password: str):
+        self.email = email
+        self.password = password  # memory only; needed to log in again on 403
+        self.key = _account_key(email)
+        self.session_id: Optional[str] = None
+        self.index: dict[str, dict] = {}
+        self.index_ts: float = 0
+        self.resource_index: dict[str, dict] = {}
+        self.resource_index_ready = False
+        self.server_etags: dict[str, str] = {}
+        self.pending_puts: set[str] = set()
+        self.index_lock = asyncio.Lock()
+        self.login_lock = asyncio.Lock()
+        self.tasks: set[asyncio.Task] = set()
+        self.last_used = time.time()
+        self.cache_loaded = False
+
+    def touch(self) -> None:
+        self.last_used = time.time()
+
+    def spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    def close(self) -> None:
+        for task in list(self.tasks):
+            task.cancel()
+        self.tasks.clear()
+        self.session_id = None
+        self.password = ""
+
+    def cache_path(self) -> Optional[str]:
+        if not DISK_CACHE:
+            return None
+        if not MULTI_USER:
+            return INDEX_CACHE_FILE
+        return os.path.join(CACHE_DIR, self.key)
+
+    def save_cache(self) -> None:
+        path = self.cache_path()
+        if not path:
+            return
+        try:
+            data = {
+                "index": self.index,
+                "resource_index": self.resource_index,
+                "server_etags": self.server_etags,
+                "ts": self.index_ts,
+            }
+            if MULTI_USER:
+                os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+                os.chmod(CACHE_DIR, 0o700)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.warning(f"Failed to save index cache: {type(e).__name__}")
+
+    def load_cache(self) -> bool:
+        path = self.cache_path()
+        if not path:
+            return False
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.index = data.get("index", {})
+            self.resource_index = data.get("resource_index", {})
+            self.server_etags = data.get("server_etags", {})
+            self.index_ts = data.get("ts", 0)
+            self.resource_index_ready = bool(self.resource_index)
+            logger.info(f"Loaded index from cache: {len(self.index)} items, "
+                        f"{len(self.resource_index)} resources")
+            return bool(self.index)
+        except Exception:
+            return False
+
+
+_current_account: contextvars.ContextVar[Optional[Account]] = contextvars.ContextVar(
+    "joplin_account", default=None)
+_default_account: Optional[Account] = None
+_accounts: dict[str, Account] = {}
+_login_failures: dict[str, collections.deque] = {}
+_sweeper: Optional[asyncio.Task] = None
+
+
+def _acct() -> Account:
+    """The account of the current request (or the env account in single-user mode)."""
+    global _default_account
+    acct = _current_account.get()
+    if acct is not None:
+        return acct
+    if MULTI_USER:
+        raise AuthError(f"Missing {CREDENTIALS_HEADER} header")
+    if _default_account is None:
+        _default_account = Account(JOPLIN_EMAIL, JOPLIN_PASSWORD)
+    return _default_account
+
+
+def parse_credentials(value: Optional[str]) -> tuple[str, str]:
+    """Split 'email:password' at the first colon (passwords may contain colons)."""
+    if not value or not value.strip():
+        raise AuthError(f"Missing {CREDENTIALS_HEADER} header")
+    email, sep, password = value.strip().partition(":")
+    email = email.strip()
+    if not sep or not email or not password:
+        raise AuthError(f"{CREDENTIALS_HEADER} must be 'email:password'")
+    return email, password
+
+
+def _scrub(text: str, *secrets: str) -> str:
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+def _recent_failures(key: str) -> collections.deque:
+    q = _login_failures.setdefault(key, collections.deque())
+    cutoff = time.time() - LOGIN_FAILURE_WINDOW
+    while q and q[0] < cutoff:
+        q.popleft()
+    if not q:
+        _login_failures.pop(key, None)
+    return q
+
+
+async def authenticate(email: str, password: str) -> Account:
+    """Return a logged-in Account for these credentials (multi-user mode).
+
+    Raises RateLimited after too many failed logins, AuthError when Joplin
+    refuses the credentials.
+    """
+    key = _account_key(email)
+    if len(_recent_failures(key)) >= LOGIN_MAX_FAILURES:
+        raise RateLimited("Too many failed logins for this account; try again in a few minutes")
+    acct = _accounts.get(key)
+    if acct is None:
+        acct = _accounts[key] = Account(email, password)
+    acct.touch()
+    same = hmac.compare_digest(acct.password.encode("utf-8"), password.encode("utf-8"))
+    if acct.session_id and same:
+        return acct
+    async with acct.login_lock:
+        if acct.session_id and hmac.compare_digest(acct.password.encode("utf-8"), password.encode("utf-8")):
+            return acct
+        try:
+            await _login(acct, password)
+        except AuthError:
+            _login_failures.setdefault(key, collections.deque()).append(time.time())
+            if not acct.session_id:
+                _accounts.pop(key, None)
+                acct.close()
+            raise
+    _login_failures.pop(key, None)
+    if not acct.cache_loaded:
+        acct.cache_loaded = True
+        if not acct.index:
+            acct.load_cache()
+    return acct
+
+
+def evict_idle_accounts(now: Optional[float] = None) -> int:
+    now = time.time() if now is None else now
+    stale = [k for k, a in _accounts.items() if now - a.last_used > ACCOUNT_IDLE_SECONDS]
+    for k in stale:
+        _accounts.pop(k).close()
+    if stale:
+        logger.info(f"Evicted {len(stale)} idle account(s); {len(_accounts)} active")
+    return len(stale)
+
+
+async def _sweep_loop() -> None:
+    while True:
+        await asyncio.sleep(max(1.0, min(60.0, ACCOUNT_IDLE_SECONDS / 2)))
+        evict_idle_accounts()
+
+
+def _ensure_sweeper() -> None:
+    global _sweeper
+    if _sweeper is None or _sweeper.done():
+        _sweeper = asyncio.create_task(_sweep_loop())
 
 
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -168,29 +391,39 @@ async def _get_client() -> httpx.AsyncClient:
     return _client
 
 
-async def _login() -> str:
-    global _session_id
+async def _login(acct: Optional[Account] = None, password: Optional[str] = None) -> str:
+    """Log in to Joplin Server. Errors never carry the credentials."""
+    acct = acct or _acct()
+    pw = acct.password if password is None else password
     client = await _get_client()
-    resp = await client.post(
-        f"{JOPLIN_SERVER_URL}/api/sessions",
-        json={"email": JOPLIN_EMAIL, "password": JOPLIN_PASSWORD},
-    )
-    resp.raise_for_status()
-    _session_id = resp.json()["id"]
+    try:
+        resp = await client.post(
+            f"{JOPLIN_SERVER_URL}/api/sessions",
+            json={"email": acct.email, "password": pw},
+        )
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"Could not reach Joplin Server ({type(e).__name__})") from None
+    if resp.status_code in (400, 401, 403):
+        raise AuthError("Joplin rejected the credentials")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Joplin login failed (HTTP {resp.status_code})")
+    acct.session_id = resp.json()["id"]
+    acct.password = pw
     logger.info("Authenticated with Joplin Server")
-    return _session_id
+    return acct.session_id
 
 
 async def _get_session() -> str:
-    global _session_id
-    if _session_id:
-        return _session_id
-    return await _login()
+    acct = _acct()
+    if acct.session_id:
+        return acct.session_id
+    return await _login(acct)
 
 
 async def _api(method: str, path: str, **kwargs) -> httpx.Response:
     """Make API request, re-login on 403."""
-    global _session_id
+    acct = _acct()
+    acct.touch()
     token = await _get_session()
     extra_headers = kwargs.pop("headers", {})
     headers = {"X-API-AUTH": token, **extra_headers}
@@ -198,8 +431,8 @@ async def _api(method: str, path: str, **kwargs) -> httpx.Response:
     client = await _get_client()
     resp = await client.request(method, f"{JOPLIN_SERVER_URL}{path}", headers=headers, **kwargs)
     if resp.status_code == 403:
-        _session_id = None
-        token = await _login()
+        acct.session_id = None
+        token = await _login(acct)
         headers["X-API-AUTH"] = token
         resp = await client.request(method, f"{JOPLIN_SERVER_URL}{path}", headers=headers, **kwargs)
     resp.raise_for_status()
@@ -215,8 +448,8 @@ async def _put_item(item_id: str, content: str):
     )
     parsed = _parse_joplin_item(content)
     if parsed and parsed["id"]:
-        _index[parsed["id"]] = parsed
-        _pending_puts.add(parsed["id"])
+        _acct().index[parsed["id"]] = parsed
+        _acct().pending_puts.add(parsed["id"])
 
 
 async def _put_note(note_id: str, title: str, body: str, meta: dict) -> None:
@@ -305,33 +538,11 @@ def _parse_resource_metadata(raw: str) -> dict:
 # -- Index --
 
 def _save_index_cache():
-    try:
-        data = {
-            "index": _index,
-            "resource_index": _resource_index,
-            "server_etags": _server_etags,
-            "ts": _index_ts,
-        }
-        with open(INDEX_CACHE_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        logger.warning(f"Failed to save index cache: {e}")
+    _acct().save_cache()
 
 
 def _load_index_cache() -> bool:
-    global _index, _index_ts, _resource_index, _resource_index_ready, _server_etags
-    try:
-        with open(INDEX_CACHE_FILE) as f:
-            data = json.load(f)
-        _index = data.get("index", {})
-        _resource_index = data.get("resource_index", {})
-        _server_etags = data.get("server_etags", {})
-        _index_ts = data.get("ts", 0)
-        _resource_index_ready = bool(_resource_index)
-        logger.info(f"Loaded index from cache: {len(_index)} items, {len(_resource_index)} resources")
-        return bool(_index)
-    except Exception:
-        return False
+    return _acct().load_cache()
 
 
 async def _fetch_item_content(name: str) -> Optional[dict]:
@@ -343,20 +554,13 @@ async def _fetch_item_content(name: str) -> Optional[dict]:
         return None
 
 
-def _get_index_lock() -> asyncio.Lock:
-    global _index_lock
-    if _index_lock is None:
-        _index_lock = asyncio.Lock()
-    return _index_lock
-
-
 async def _do_build_index() -> dict[str, dict]:
     """Incremental index: only fetch new/changed items based on server updated_time."""
-    global _index, _index_ts, _resource_index_ready, _server_etags
+    a = _acct()
 
-    lock = _get_index_lock()
+    lock = a.index_lock
     if lock.locked():
-        return _index
+        return a.index
 
     async with lock:
         t0 = time.time()
@@ -380,18 +584,18 @@ async def _do_build_index() -> dict[str, dict]:
             item_id = it["name"].replace(".md", "")
             server_ids.add(item_id)
             server_ut = str(it.get("updated_time", ""))
-            if _server_etags.get(item_id) != server_ut:
+            if a.server_etags.get(item_id) != server_ut:
                 to_fetch.append((it["name"], item_id, server_ut))
 
-        _pending_puts.intersection_update(_index)
-        _pending_puts.difference_update(server_ids)
-        deleted = [k for k in list(_index) if k not in server_ids
-                   and k not in _pending_puts and _index[k].get("type") != TYPE_RESOURCE]
+        a.pending_puts.intersection_update(a.index)
+        a.pending_puts.difference_update(server_ids)
+        deleted = [k for k in list(a.index) if k not in server_ids
+                   and k not in a.pending_puts and a.index[k].get("type") != TYPE_RESOURCE]
 
         if not to_fetch and not deleted:
-            _index_ts = time.time()
-            logger.info(f"Index up to date: {len(_index)} items ({time.time() - t0:.1f}s)")
-            return _index
+            a.index_ts = time.time()
+            logger.info(f"Index up to date: {len(a.index)} items ({time.time() - t0:.1f}s)")
+            return a.index
 
         logger.info(f"Syncing index: {len(to_fetch)} changed, {len(deleted)} deleted"
                      f" (of {len(md_items)} total)")
@@ -404,37 +608,38 @@ async def _do_build_index() -> dict[str, dict]:
 
         results = await asyncio.gather(*[_fetch_with_sem(name) for name, _, _ in to_fetch])
         for (_, item_id, server_ut), parsed in zip(to_fetch, results):
-            _server_etags[item_id] = server_ut
+            a.server_etags[item_id] = server_ut
             if parsed and parsed["id"]:
-                _index[parsed["id"]] = parsed
+                a.index[parsed["id"]] = parsed
 
         for item_id in deleted:
-            _index.pop(item_id, None)
-            _server_etags.pop(item_id, None)
+            a.index.pop(item_id, None)
+            a.server_etags.pop(item_id, None)
 
-        _index_ts = time.time()
-        _resource_index_ready = False
+        a.index_ts = time.time()
+        a.resource_index_ready = False
         _save_index_cache()
-        logger.info(f"Index: {len(_index)} items, synced {len(to_fetch)} in {time.time() - t0:.1f}s")
-        return _index
+        logger.info(f"Index: {len(a.index)} items, synced {len(to_fetch)} in {time.time() - t0:.1f}s")
+        return a.index
 
 
 async def _build_index(force: bool = False) -> dict[str, dict]:
     """Return index, triggering background refresh if TTL expired."""
-    if not force and _index and (time.time() - _index_ts) < INDEX_TTL:
-        return _index
+    a = _acct()
+    if not force and a.index and (time.time() - a.index_ts) < INDEX_TTL:
+        return a.index
 
-    if _index:
-        asyncio.create_task(_do_build_index())
-        return _index
+    if a.index:
+        a.spawn(_do_build_index())
+        return a.index
 
     return await _do_build_index()
 
 
 async def _ensure_resource_index():
     """Build resource index lazily on first access."""
-    global _resource_index, _resource_index_ready
-    if _resource_index_ready:
+    a = _acct()
+    if a.resource_index_ready:
         return
 
     await _build_index()
@@ -470,10 +675,10 @@ async def _ensure_resource_index():
         if parsed and parsed["id"]:
             new_res_index[parsed["id"]] = parsed
 
-    _resource_index = new_res_index
-    _resource_index_ready = True
+    a.resource_index = new_res_index
+    a.resource_index_ready = True
     _save_index_cache()
-    logger.info(f"Resource index: {len(_resource_index)} resources in {time.time() - t0:.1f}s")
+    logger.info(f"Resource index: {len(a.resource_index)} resources in {time.time() - t0:.1f}s")
 
 
 async def _get_items_by_type(type_id: int, force_refresh: bool = False) -> list[dict]:
@@ -527,7 +732,7 @@ async def _fetch_note(note_id: str) -> dict:
 async def _download_resource(resource_id: str) -> tuple[bytes, str, str]:
     """Returns (bytes, mime, title)."""
     await _ensure_resource_index()
-    res = _resource_index.get(resource_id)
+    res = _acct().resource_index.get(resource_id)
     resp = await _api("GET", f"/api/items/root:/.resource/{resource_id}:/content")
     return resp.content, res["mime"] if res else "application/octet-stream", res["title"] if res else resource_id
 
@@ -547,7 +752,7 @@ def _format_note_header(parsed: dict, nb_name: str) -> str:
 
 def _replace_resource_refs(body: str) -> str:
     for ref_id in _find_resource_refs(body):
-        res = _resource_index.get(ref_id)
+        res = _acct().resource_index.get(ref_id)
         label = f"{res['title']} ({res['mime']}, {res['size']/1024:.0f}KB)" if res else f"resource:{ref_id}"
         body = re.sub(rf'<img\s[^>]*src=":/{ ref_id}"[^>]*/?>', f"[{label}]", body)
         body = re.sub(rf'<img\s+src=":/{ ref_id}"[^>]*/?>', f"[{label}]", body)
@@ -558,7 +763,7 @@ def _replace_resource_refs(body: str) -> str:
 def _localize_resource_refs(body: str) -> str:
     """Replace Joplin resource refs with local filenames."""
     for ref_id in _find_resource_refs(body):
-        res = _resource_index.get(ref_id)
+        res = _acct().resource_index.get(ref_id)
         fname = res["title"] if res else f"{ref_id}.bin"
         body = re.sub(rf'<img\s[^>]*src=":/{ ref_id}"[^>]*/?>', f"![{fname}]({fname})", body)
         body = re.sub(rf'<img\s+src=":/{ ref_id}"[^>]*/?>', f"![{fname}]({fname})", body)
@@ -888,10 +1093,12 @@ type_: 6"""
 
 @asynccontextmanager
 async def _lifespan(server):
-    if not _index:
-        cached = _load_index_cache()
-        if not cached or (time.time() - _index_ts) > INDEX_TTL:
-            asyncio.create_task(_do_build_index())
+    if not MULTI_USER:
+        acct = _acct()
+        if not acct.index:
+            cached = acct.load_cache()
+            if not cached or (time.time() - acct.index_ts) > INDEX_TTL:
+                acct.spawn(_do_build_index())
     yield {}
 
 mcp = FastMCP(
@@ -900,6 +1107,9 @@ mcp = FastMCP(
     host=os.environ.get("MCP_HOST", "0.0.0.0"),
     port=int(os.environ.get("MCP_PORT", "8081")),
     lifespan=_lifespan,
+    # Multi-user: no server-side MCP sessions, so every request is executed with
+    # the credentials of that very request (and none can be replayed by session id).
+    stateless_http=MULTI_USER,
 )
 
 
@@ -912,7 +1122,7 @@ async def ping_joplin() -> str:
         await _get_session()
         return f"Connected to {JOPLIN_SERVER_URL}"
     except Exception as e:
-        return f"Connection failed: {e}"
+        return f"Connection failed: {_scrub(str(e), _acct().password)}"
 
 
 # -- Notebooks --
@@ -996,7 +1206,7 @@ async def get_or_create_notebook(path: str) -> str:
     parent_id = ""
     created = []
     for name in [p.strip() for p in path.split("/") if p.strip()]:
-        match = next((v for v in _index.values() if v["type"] == TYPE_FOLDER
+        match = next((v for v in _acct().index.values() if v["type"] == TYPE_FOLDER
                       and v["parent_id"] == parent_id and v["title"] == name), None)
         if match:
             parent_id = match["id"]
@@ -1042,7 +1252,7 @@ async def delete_notebook(notebook_id: str, force: bool = False) -> str:
 
     await _api("DELETE", f"/api/items/root:/{notebook_id}.md:")
     for cid in [child["id"] for child in children] + [notebook_id]:
-        _index.pop(cid, None)
+        _acct().index.pop(cid, None)
 
     result = f"Notebook deleted: **{nb['title']}** (ID: `{notebook_id}`)"
     if deleted:
@@ -1597,7 +1807,7 @@ async def delete_note(note_id: str) -> str:
         if parsed["type"] != TYPE_NOTE:
             return f"Item {note_id} is not a note."
         await _api("DELETE", f"/api/items/root:/{note_id}.md:")
-        _index.pop(note_id, None)
+        _acct().index.pop(note_id, None)
         return f"Note deleted: **{parsed['title']}** (ID: `{note_id}`)"
     except httpx.HTTPStatusError as e:
         return f"Note {note_id} not found." if e.response.status_code == 404 else str(e)
@@ -1836,8 +2046,8 @@ async def delete_tag(tag_id: str) -> str:
 
     await _api("DELETE", f"/api/items/root:/{tag_id}.md:")
     for nt in note_tags:
-        _index.pop(nt["id"], None)
-    _index.pop(tag_id, None)
+        _acct().index.pop(nt["id"], None)
+    _acct().index.pop(tag_id, None)
     return f"Tag deleted: **{tag['title']}** (ID: `{tag_id}`, removed from {len(note_tags)} notes)"
 
 
@@ -1922,7 +2132,7 @@ async def remove_tag_from_note(tag_id: str, note_id: str) -> str:
 
     for nt in note_tags:
         await _api("DELETE", f"/api/items/root:/{nt['id']}.md:")
-        _index.pop(nt["id"], None)
+        _acct().index.pop(nt["id"], None)
 
     tag = idx.get(tag_id)
     note = idx.get(note_id)
@@ -1942,7 +2152,7 @@ async def get_note_resources(note_id: str) -> str:
     if err:
         return err
     await _ensure_resource_index()
-    note = _index.get(note_id)
+    note = _acct().index.get(note_id)
     if not note:
         return f"Note {note_id} not found."
     if note["type"] != TYPE_NOTE:
@@ -1954,7 +2164,7 @@ async def get_note_resources(note_id: str) -> str:
 
     lines = [f"Resources in '{note['title']}' ({len(refs)})\n"]
     for ref_id in refs:
-        res = _resource_index.get(ref_id)
+        res = _acct().resource_index.get(ref_id)
         if res:
             lines.append(f"- **{res['title']}** `{ref_id}` — {res['mime']}, {res['size']/1024:.0f} KB")
         else:
@@ -1973,7 +2183,7 @@ async def get_resource_info(resource_id: str) -> str:
     if err:
         return err
     await _ensure_resource_index()
-    res = _resource_index.get(resource_id)
+    res = _acct().resource_index.get(resource_id)
     if not res:
         try:
             resp = await _api("GET", f"/api/items/root:/{resource_id}.md:/content")
@@ -2003,7 +2213,7 @@ async def download_resource(resource_id: str) -> str:
     if err:
         return err
     await _ensure_resource_index()
-    res = _resource_index.get(resource_id)
+    res = _acct().resource_index.get(resource_id)
     if res and res["size"] > MAX_RESOURCE_SIZE:
         return f"Resource too large ({res['size'] / 1024 / 1024:.1f} MB). Max 50 MB."
 
@@ -2015,7 +2225,87 @@ async def download_resource(resource_id: str) -> str:
         return f"Resource {resource_id} not found." if e.response.status_code == 404 else str(e)
 
 
+# -- HTTP authentication (multi-user mode) --
+
+_warned_header_ignored = False
+
+
+def _plain_response(status: int, message: str, extra: Optional[list] = None):
+    body = json.dumps({"error": message}).encode("utf-8")
+    headers = [(b"content-type", b"application/json"),
+               (b"content-length", str(len(body)).encode())] + (extra or [])
+    return status, headers, body
+
+
+class CredentialsMiddleware:
+    """ASGI middleware: reads the credentials header and binds the account.
+
+    Multi-user mode: a missing/invalid header or a failed login is answered with
+    HTTP 401 (429 when rate limited) before the request reaches the MCP layer.
+    Single-user mode: the header is ignored (a warning is logged once).
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        raw = None
+        want = CREDENTIALS_HEADER.lower().encode("latin-1")
+        for name, value in scope.get("headers", []):
+            if name == want:
+                raw = value.decode("utf-8", "replace")
+                break
+
+        if not MULTI_USER:
+            global _warned_header_ignored
+            if raw is not None and not _warned_header_ignored:
+                _warned_header_ignored = True
+                logger.warning(f"{CREDENTIALS_HEADER} header ignored: not in multi-user mode "
+                               "(set JOPLIN_MULTI_USER=1 to use it)")
+            return await self.app(scope, receive, send)
+
+        _ensure_sweeper()
+        evict_idle_accounts()
+        try:
+            email, password = parse_credentials(raw)
+            acct = await authenticate(email, password)
+        except AuthError as e:
+            status, headers, body = _plain_response(
+                401, f"Unauthorized: {e}",
+                [(b"www-authenticate", f'Bearer realm="joplin"'.encode())])
+        except RateLimited as e:
+            status, headers, body = _plain_response(429, str(e), [(b"retry-after", b"300")])
+        except Exception as e:
+            logger.warning(f"Login error: {type(e).__name__}")
+            status, headers, body = _plain_response(502, "Could not log in to Joplin Server")
+        else:
+            token = _current_account.set(acct)
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                _current_account.reset(token)
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": body})
+
+
+def _build_http_app(transport: str):
+    app = mcp.streamable_http_app() if transport == "streamable-http" else mcp.sse_app()
+    app.add_middleware(CredentialsMiddleware)
+    return app
+
+
 # -- Entry point --
 
 if __name__ == "__main__":
-    mcp.run(transport=os.environ.get("MCP_TRANSPORT", "stdio"))
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    if transport == "stdio":
+        if MULTI_USER:
+            raise SystemExit("JOPLIN_MULTI_USER requires an HTTP transport (sse or streamable-http)")
+        mcp.run(transport="stdio")
+    else:
+        import uvicorn
+        uvicorn.run(_build_http_app(transport), host=mcp.settings.host, port=mcp.settings.port,
+                    log_level=mcp.settings.log_level.lower())
